@@ -1,6 +1,13 @@
 # 🗺️ GISNAS - Project Roadmap
 
 Dokumen ini berisi daftar tugas (*checklist*) untuk pengembangan aplikasi WebGIS **GISNAS**.
+## ☕ Donasi
+
+Jika proyek ini bermanfaat, Anda dapat mendukung pengembangan selanjutnya melalui:
+
+[![Donasi via Ko-fi](https://img.shields.io/badge/Support%20me-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/gisnas)
+
+https://ko-fi.com/gisnas
 
 ## 1. Inisialisasi Proyek & Infrastruktur
 - [x] Setup `docker-compose.yml`
@@ -55,11 +62,5 @@ Proyek ini dilisensikan di bawah **Apache License 2.0** – lihat file [LICENSE]
 Copyright 2026 Hidayatullah, S.T
 ```
 
-## ☕ Donasi
 
-Jika proyek ini bermanfaat, Anda dapat mendukung pengembangan selanjutnya melalui:
-
-[![Donasi via Ko-fi](https://img.shields.io/badge/Support%20me-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/gisnas)
-
-https://ko-fi.com/gisnas
 
