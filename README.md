@@ -12,14 +12,21 @@ https://ko-fi.com/gisnas
 ## 1. QGIS Plugin
 - [x] Gunakan gisnas_sketsa.zip lalu Install plugin melalui Install from ZIP
 
-## 1. Inisialisasi Proyek & Infrastruktur
+## 2. Inisialisasi Proyek & Infrastruktur
 - [x] Setup `docker-compose.yml`
 - [x] Setup container PostGIS
 - [x] Inisialisasi kerangka Backend (Go + Dockerfile)
 - [x] Inisialisasi kerangka Frontend (ReactJS + Vite + Dockerfile)
 - [x] Konfigurasi volume & environment variables untuk production (VPS)
 
-## 2. Frontend (ReactJS)
+## 3. Cara Kerja
+- [x] Copy URL QGIS token ke Plugin
+- [x] Downoad Layer yang akan diedit
+- [x] Edit, Tambah, Hapus, lalu simpan
+- [x] Pilih layer di Plugin, Push Change. Perubahan terlihat lalu OK
+- [x] Jika selesai, Klik Download untuk melihat perubahan
+
+## 4. Frontend (ReactJS)
 - [x] Setup Routing (React Router)
 - [x] **Halaman Login & Daftar**
 - [x] **Halaman Dashboard Utama**
@@ -35,7 +42,7 @@ https://ko-fi.com/gisnas
   - [x] Menampilkan URL OGC API
   - [x] Manajemen Token: Generate, Start (Running), Stop (Revoke akses)
 
-## 3. Backend (Go)
+## 5. Backend (Go)
 - [x] Setup koneksi ke PostGIS (pgx/gorm)
 - [x] Autentikasi JWT (Endpoint `/login`, `/register`)
 - [x] API untuk mengunggah dan mengekstrak file SHP
@@ -47,7 +54,7 @@ https://ko-fi.com/gisnas
   - [x] Validasi status token (Hanya izinkan akses jika status = "Running")
   - [x] Mendukung operasi CRUD Edit (Create, Update, Delete) langsung dari QGIS
 
-## 4. Database (PostGIS)
+## 6. Database (PostGIS)
 - [x] Desain skema tabel `users`
 - [x] Desain skema tabel `datasets` (metadata)
 - [x] Desain skema tabel `api_tokens` (id, token, status: running/stopped)
