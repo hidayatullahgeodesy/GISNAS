@@ -21,13 +21,11 @@ https://ko-fi.com/gisnas
 - [x] **Halaman Login & Daftar**
 - [x] **Halaman Dashboard Utama**
 - [x] **Komponen Map Preview**
-  - [x] Integrasi peta dasar (MapLibre GL JS / Leaflet)
-  - [x] Mode *Public* (Tanpa login) & *Private* (Harus login)
+  - [x] Integrasi peta dasar (MapLibre GL JS )
+  - [x] Mode *Private* (Harus login)
 - [x] **Fitur Upload SHP / Bikin Baru**
   - [x] UI untuk *drag-and-drop* file ZIP (.shp)
 - [x] **Fitur Manajemen Data**
-  - [x] UI Tabel Data
-  - [x] Fitur Edit Kolom Tabel per Dataset
 - [x] **Fitur Styling Peta**
   - [x] UI untuk mengubah warna/simbol layer
 - [x] **Halaman Konfigurasi OGC API**
@@ -59,7 +57,7 @@ https://ko-fi.com/gisnas
 Proyek ini dilisensikan di bawah **Apache License 2.0** – lihat file [LICENSE](LICENSE) untuk detail.
 
 ```
-Copyright 2026 Hidayatullah, S.T
+Copyright 2026 Hidayatullah
 ```
 
 
