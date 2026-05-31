@@ -9,6 +9,9 @@ Jika proyek ini bermanfaat, Anda dapat mendukung pengembangan selanjutnya melalu
 
 https://ko-fi.com/gisnas
 
+## 1. QGIS Plugin
+- [x] Gunakan gisnas_sketsa.zip lalu Install plugin melalui Install from ZIP
+
 ## 1. Inisialisasi Proyek & Infrastruktur
 - [x] Setup `docker-compose.yml`
 - [x] Setup container PostGIS
