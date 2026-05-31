@@ -793,7 +793,20 @@ function MapPreview() {
       container: 'map',
       style: basemaps[basemap],
       center: [118.0, -2.5],
-      zoom: 4
+      zoom: 4,
+      transformRequest: (url, resourceType) => {
+        if (resourceType === 'Tile' && url.includes('/api/tiles/')) {
+          const token = localStorage.getItem('gisnas_token');
+          return {
+            url,
+            headers: {
+              ...authHeaders(),
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+          };
+        }
+        return { url };
+      },
     });
     map.addControl(new maplibregl.NavigationControl(), 'top-left');
     

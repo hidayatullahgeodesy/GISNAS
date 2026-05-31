@@ -245,15 +245,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	
 	w.Header().Set("Content-Type", "application/json")
 	
-	// Create JWT token using secret from .env (MVP simple mock generation).
-	// Guard short JWT_SECRET values so login never panics on slicing.
-	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" { jwtSecret = "default_secret" }
-	secretPreview := jwtSecret
-	if len(secretPreview) > 10 {
-		secretPreview = secretPreview[:10]
-	}
-	mockToken := fmt.Sprintf("JWT-GISNAS-%s-%s", user.Username, secretPreview)
+	mockToken := buildUserToken(user.Username)
 
 	var nama string
 	db.QueryRow("SELECT COALESCE(nama, '') FROM users WHERE username = $1", user.Username).Scan(&nama)
@@ -275,6 +267,108 @@ func requestRole(r *http.Request) string {
 		return role
 	}
 	return strings.TrimSpace(r.URL.Query().Get("role"))
+}
+
+func buildUserToken(username string) string {
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "default_secret"
+	}
+	secretPreview := jwtSecret
+	if len(secretPreview) > 10 {
+		secretPreview = secretPreview[:10]
+	}
+	return fmt.Sprintf("JWT-GISNAS-%s-%s", username, secretPreview)
+}
+
+func parseAndValidateUserToken(token string) (username, role string, ok bool) {
+	if !strings.HasPrefix(token, "JWT-GISNAS-") {
+		return "", "", false
+	}
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "default_secret"
+	}
+	secretPreview := jwtSecret
+	if len(secretPreview) > 10 {
+		secretPreview = secretPreview[:10]
+	}
+	suffix := "-" + secretPreview
+	rest := strings.TrimPrefix(token, "JWT-GISNAS-")
+	if !strings.HasSuffix(rest, suffix) {
+		return "", "", false
+	}
+	username = strings.TrimSuffix(rest, suffix)
+	if username == "" || buildUserToken(username) != token {
+		return "", "", false
+	}
+	var isBlocked bool
+	err := db.QueryRow("SELECT role, COALESCE(is_blocked, FALSE) FROM users WHERE username = $1", username).Scan(&role, &isBlocked)
+	if err != nil || isBlocked {
+		return "", "", false
+	}
+	return username, role, true
+}
+
+func extractAuthToken(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	if t := r.Header.Get("X-GISNAS-Token"); t != "" {
+		return strings.TrimSpace(t)
+	}
+	if t := r.URL.Query().Get("access_token"); t != "" {
+		return strings.TrimSpace(t)
+	}
+	return ""
+}
+
+func userCanAccessWorkspace(username, role string, workspaceID int) bool {
+	if role == "superadmin" {
+		return true
+	}
+	var owner string
+	err := db.QueryRow("SELECT COALESCE(owner_username, '') FROM workspaces WHERE id = $1", workspaceID).Scan(&owner)
+	if err != nil {
+		return false
+	}
+	if owner == username {
+		return true
+	}
+	status, _, _, canOpen, found := workspaceMemberPermissions(workspaceID, username)
+	return found && status == "accepted" && canOpen
+}
+
+func authorizeTileAccess(r *http.Request, tableName string) bool {
+	var workspaceID int
+	err := db.QueryRow("SELECT workspace_id FROM datasets WHERE table_name = $1", tableName).Scan(&workspaceID)
+	if err != nil {
+		return false
+	}
+
+	apiToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	if apiToken != "" {
+		var status string
+		var wsID sql.NullInt64
+		err := db.QueryRow("SELECT status, workspace_id FROM api_tokens WHERE token_string = $1", apiToken).Scan(&status, &wsID)
+		if err != nil || status == "STOPPED" || !wsID.Valid || int(wsID.Int64) != workspaceID {
+			return false
+		}
+		return true
+	}
+
+	userToken := extractAuthToken(r)
+	if userToken == "" {
+		return false
+	}
+	username, role, ok := parseAndValidateUserToken(userToken)
+	if !ok {
+		return false
+	}
+	if hdr := requestUsername(r); hdr != "" && hdr != username {
+		return false
+	}
+	return userCanAccessWorkspace(username, role, workspaceID)
 }
 
 func workspaceCanManage(owner string, role string, username string) bool {
@@ -1643,8 +1737,6 @@ func saveStylingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func mvtTileHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
 	path := strings.TrimPrefix(r.URL.Path, "/api/tiles/")
 	path = strings.TrimSuffix(path, ".pbf")
 	parts := strings.Split(path, "/")
@@ -1654,6 +1746,11 @@ func mvtTileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tableName := parts[0]
+	if !authorizeTileAccess(r, tableName) {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error": "Akses tile ditolak. Login atau sertakan token workspace yang valid."}`, http.StatusUnauthorized)
+		return
+	}
 	z, errZ := strconv.Atoi(parts[1])
 	x, errX := strconv.Atoi(parts[2])
 	y, errY := strconv.Atoi(parts[3])
@@ -3407,7 +3504,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GISNAS-User, X-GISNAS-Role")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GISNAS-User, X-GISNAS-Role, X-GISNAS-Token")
 		if r.Method == "OPTIONS" {
 			if strings.HasPrefix(r.URL.Path, "/api/ogc") || strings.HasPrefix(r.URL.Path, "/token/") {
 				next.ServeHTTP(w, r)
