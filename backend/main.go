@@ -1244,6 +1244,78 @@ func sanitizeIdentifier(s string) string {
 	return string(res)
 }
 
+// Kolom yang dikelola server / GPKG, bukan input client saat insert-update.
+func isReservedFeatureColumn(col string) bool {
+	switch col {
+	case "geom", "id", "fid", "create_gn", "update_gn":
+		return true
+	default:
+		return false
+	}
+}
+
+// Setelah import GPKG/ogr2ogr: isi id yang masih NULL (pakai fid jika ada, lalu SERIAL).
+func repairNullFeatureIDs(tableName string) (filled int64, err error) {
+	safeTable := sanitizeIdentifier(tableName)
+	if safeTable == "" || safeTable != tableName {
+		return 0, fmt.Errorf("nama tabel tidak valid")
+	}
+
+	var hasID bool
+	err = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'id'
+		)`, tableName).Scan(&hasID)
+	if err != nil || !hasID {
+		return 0, err
+	}
+
+	var hasFID bool
+	_ = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'fid'
+		)`, tableName).Scan(&hasFID)
+
+	if hasFID {
+		res, e := db.Exec(fmt.Sprintf(`UPDATE %s SET id = fid WHERE id IS NULL AND fid IS NOT NULL`, safeTable))
+		if e != nil {
+			log.Printf("repairNullFeatureIDs fid→id %s: %v", tableName, e)
+		} else if res != nil {
+			n, _ := res.RowsAffected()
+			filled += n
+		}
+	}
+
+	var nullCount int
+	_ = db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id IS NULL`, safeTable)).Scan(&nullCount)
+	if nullCount == 0 {
+		return filled, nil
+	}
+
+	seqName := safeTable + "_id_seq"
+	if _, e := db.Exec(fmt.Sprintf(`CREATE SEQUENCE IF NOT EXISTS %s`, seqName)); e != nil {
+		return filled, e
+	}
+	if _, e := db.Exec(fmt.Sprintf(
+		`SELECT setval('%s', GREATEST(COALESCE((SELECT MAX(id) FROM %s), 0), 1), (SELECT COUNT(*) = 0 FROM %s WHERE id IS NOT NULL))`,
+		seqName, safeTable, safeTable,
+	)); e != nil {
+		return filled, e
+	}
+
+	res, err := db.Exec(fmt.Sprintf(`UPDATE %s SET id = nextval('%s') WHERE id IS NULL`, safeTable, seqName))
+	if err != nil {
+		return filled, err
+	}
+	n, _ := res.RowsAffected()
+	filled += n
+
+	_, _ = db.Exec(fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN id SET DEFAULT nextval('%s')`, safeTable, seqName))
+	return filled, nil
+}
+
 func sqlValueToJSON(val interface{}) interface{} {
 	if val == nil {
 		return nil
@@ -1602,7 +1674,7 @@ func insertDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 	paramIdx := 3
 	for k, v := range req.Attributes {
 		safeK := sanitizeIdentifier(k)
-		if safeK == "" || safeK == "geom" || safeK == "id" {
+		if safeK == "" || isReservedFeatureColumn(safeK) {
 			continue
 		}
 		cols = append(cols, safeK)
@@ -1611,8 +1683,9 @@ func insertDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 		paramIdx++
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", tableName, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	_, err = db.Exec(query, vals...)
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", tableName, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	var newID int
+	err = db.QueryRow(query, vals...).Scan(&newID)
 	if err != nil {
 		http.Error(w, "Gagal insert data: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1620,7 +1693,10 @@ func insertDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 	clearTileCache(tableName)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"message": "Data spasial berhasil ditambahkan!"}`))
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Data spasial berhasil ditambahkan!",
+		"id":      newID,
+	})
 }
 
 func addDatasetColumnHandler(w http.ResponseWriter, r *http.Request) {
@@ -1883,7 +1959,7 @@ func updateDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 
 	for k, v := range req.Attributes {
 		safeK := sanitizeIdentifier(k)
-		if safeK == "" || safeK == "geom" || safeK == "id" {
+		if safeK == "" || isReservedFeatureColumn(safeK) || v == nil {
 			continue
 		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", safeK, paramIdx))
@@ -2087,6 +2163,11 @@ func ogcUploadGPKGHandler(w http.ResponseWriter, r *http.Request) {
 
 	db.Exec(fmt.Sprintf("CREATE INDEX ON %s USING GIST(geom);", tableName))
 
+	repairedIDs, repairErr := repairNullFeatureIDs(tableName)
+	if repairErr != nil {
+		log.Printf("GPKG upload: perbaikan id NULL gagal untuk %s: %v", tableName, repairErr)
+	}
+
 	var featureCount int
 	db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&featureCount)
 
@@ -2101,6 +2182,7 @@ func ogcUploadGPKGHandler(w http.ResponseWriter, r *http.Request) {
 		"name":          displayName,
 		"table_name":    tableName,
 		"feature_count": featureCount,
+		"ids_repaired":  repairedIDs,
 	})
 }
 
@@ -2829,10 +2911,12 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				propDef := pgToJSONSchema(cType)
 				propDef["title"] = cName
 				propDef["x-ogc-property-seq"] = len(properties)
-				properties[cName] = propDef
-				if cName == "id" {
-					required = append(required, cName)
+				// id & fid dikelola server; jangan wajibkan saat digitize di QGIS (hindari id=NULL saat push).
+				if cName == "id" || cName == "fid" {
+					propDef["readOnly"] = true
+					continue
 				}
+				properties[cName] = propDef
 			}
 
 			queryable := map[string]interface{}{
@@ -2877,7 +2961,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				colRows, err := db.Query(`
 					SELECT column_name 
 					FROM information_schema.columns 
-					WHERE table_name = $1 AND column_name NOT IN ('geom', 'id', 'create_gn', 'update_gn')
+					WHERE table_name = $1 AND column_name NOT IN ('geom', 'id', 'fid', 'create_gn', 'update_gn')
 				`, tableName)
 				if err != nil {
 					http.Error(w, `{"error": "Gagal membaca skema"}`, http.StatusInternalServerError)
@@ -2908,12 +2992,17 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 
 				pCount := 1
 				for _, col := range columns {
-					if val, ok := body.Properties[col]; ok {
-						pCount++
-						cols = append(cols, fmt.Sprintf(`"%s"`, col))
-						placeholders = append(placeholders, fmt.Sprintf("$%d", pCount))
-						vals = append(vals, val)
+					if isReservedFeatureColumn(col) {
+						continue
 					}
+					val, ok := body.Properties[col]
+					if !ok || val == nil {
+						continue
+					}
+					pCount++
+					cols = append(cols, fmt.Sprintf(`"%s"`, col))
+					placeholders = append(placeholders, fmt.Sprintf("$%d", pCount))
+					vals = append(vals, val)
 				}
 
 				query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", tableName, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
@@ -3383,14 +3472,16 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 
 				pCount := 1
 				for _, col := range columns {
-					if col == "id" {
+					if isReservedFeatureColumn(col) {
 						continue
 					}
-					if val, ok := body.Properties[col]; ok {
-						pCount++
-						setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
-						vals = append(vals, val)
+					val, ok := body.Properties[col]
+					if !ok || val == nil {
+						continue
 					}
+					pCount++
+					setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
+					vals = append(vals, val)
 				}
 
 				pCount++
@@ -3458,14 +3549,16 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 					patch.Properties = &cleanProps
 
 					for _, col := range columns {
-						if col == "id" {
+						if isReservedFeatureColumn(col) {
 							continue
 						}
-						if val, ok := (*patch.Properties)[col]; ok {
-							pCount++
-							setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
-							vals = append(vals, val)
+						val, ok := (*patch.Properties)[col]
+						if !ok || val == nil {
+							continue
 						}
+						pCount++
+						setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
+						vals = append(vals, val)
 					}
 				}
 
