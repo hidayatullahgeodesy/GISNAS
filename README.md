@@ -59,7 +59,7 @@ Copyright 2026 Hidayatullah, S.T
 
 Jika proyek ini bermanfaat, Anda dapat mendukung pengembangan selanjutnya melalui:
 
-[![Donasi via Ko-fi](https://img.shields.io/badge/Support%20me-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/gisna)
+[![Donasi via Ko-fi](https://img.shields.io/badge/Support%20me-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/gisnas)
 
-https://ko-fi.com/gisna
+https://ko-fi.com/gisnas
 
