@@ -11,7 +11,7 @@ Contains:
 import os
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import (
-    QDialog, QDockWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QListWidget, QListWidgetItem, QTextEdit,
     QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QFileDialog, QMessageBox, QGroupBox,
@@ -61,49 +61,25 @@ class _Worker(QThread):
 # MAIN PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 
-class SketsaPanel(QDockWidget):
-    """Panel dock GISNAS Sketsa — bisa dipindah, di-dock, atau diminimize di tepi QGIS."""
+class SketsaPanel(QDialog):
+    """Main GISNAS Sketsa panel — connection, collection list, sync controls."""
 
     def __init__(self, iface):
-        super().__init__("GISNAS Sketsa — Local GPKG + Delta Sync", iface.mainWindow())
+        super().__init__(iface.mainWindow())
         self.iface = iface
-        self.setObjectName("GisnasSketsaDockWidget")
-        self.setMinimumWidth(480)
-        try:
-            dock_features = (
-                QDockWidget.DockWidgetClosable
-                | QDockWidget.DockWidgetMovable
-                | QDockWidget.DockWidgetFloatable
-            )
-        except AttributeError:
-            dock_features = (
-                QDockWidget.DockWidgetClosable
-                | QDockWidget.DockWidgetMovable
-                | QDockWidget.DockWidgetFloatable
-            )
-        self.setFeatures(dock_features)
-
+        self.setWindowTitle("GISNAS Sketsa — Local GPKG + Delta Sync")
+        self.setMinimumSize(560, 640)
         self._worker = None
-        self._busy = False
-        self._connected = False
 
         # State
         self.base_url = ""
         self.token = ""
         self.collections = []  # list of {"id": table_name, "title": name, ...}
 
-        self._content = QWidget()
-        self.setWidget(self._content)
         self._init_ui()
-        self._apply_ui_state()
-
-    def closeEvent(self, event):
-        """Tutup = sembunyikan panel (bisa dibuka lagi dari toolbar)."""
-        event.ignore()
-        self.hide()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self._content)
+        layout = QVBoxLayout(self)
 
         # --- Connection ---
         grp_conn = QGroupBox("🔗 OGC API Connection")
@@ -114,34 +90,12 @@ class SketsaPanel(QDockWidget):
             "http://host/token/GISNAS-xxxx/api/ogc/features"
         )
         conn_layout.addWidget(self.url_input)
-
-        self.lbl_conn_status = QLabel("● Belum terhubung")
-        self.lbl_conn_status.setStyleSheet("color: #64748b; font-size: 0.85rem;")
-        conn_layout.addWidget(self.lbl_conn_status)
-
-        conn_btn_row = QHBoxLayout()
-        self.btn_connect = QPushButton("🔌 Connect")
+        self.btn_connect = QPushButton("🔌 Connect && Fetch Layers")
         self.btn_connect.setStyleSheet(
             "background-color: #3b82f6; color: white; font-weight: bold; padding: 6px;"
         )
         self.btn_connect.clicked.connect(self._on_connect)
-        conn_btn_row.addWidget(self.btn_connect)
-
-        self.btn_disconnect = QPushButton("⏏ Disconnect")
-        self.btn_disconnect.setStyleSheet(
-            "background-color: #64748b; color: white; font-weight: bold; padding: 6px;"
-        )
-        self.btn_disconnect.clicked.connect(self._on_disconnect)
-        conn_btn_row.addWidget(self.btn_disconnect)
-        conn_layout.addLayout(conn_btn_row)
-
-        hint = QLabel(
-            "Panel bisa di-dock kiri/kanan QGIS, dilepas (float), atau diminimize ke tab tepi jendela."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #94a3b8; font-size: 0.75rem;")
-        conn_layout.addWidget(hint)
-
+        conn_layout.addWidget(self.btn_connect)
         grp_conn.setLayout(conn_layout)
         layout.addWidget(grp_conn)
 
@@ -173,15 +127,6 @@ class SketsaPanel(QDockWidget):
         self.btn_refresh = QPushButton("🔄 Refresh")
         self.btn_refresh.clicked.connect(self._on_refresh)
         btn_row.addWidget(self.btn_refresh)
-
-        self.btn_open_folder = QPushButton("📂 Open Folder")
-        self.btn_open_folder.setToolTip(
-            "Buka folder penyimpanan GPKG lokal (~/.gisnas_sketsa/...).\n"
-            "Hapus file .gpkg di sini lalu Download ulang jika perlu reset data.\n"
-            "Tutup/hapus layer dari peta QGIS dulu agar file tidak terkunci."
-        )
-        self.btn_open_folder.clicked.connect(self._on_open_folder)
-        btn_row.addWidget(self.btn_open_folder)
 
         self.btn_rename_layer = QPushButton("✏️ Rename")
         self.btn_rename_layer.clicked.connect(self._on_rename_layer)
@@ -280,74 +225,8 @@ class SketsaPanel(QDockWidget):
             self._log(f"❌ Failed: {e}")
             return
 
-        self._set_connected_state(True)
+        self._refresh_collection_list()
         self._log(f"✅ Connected! {len(self.collections)} layers found.")
-
-    def _on_disconnect(self):
-        if self._worker and self._worker.isRunning():
-            QMessageBox.warning(
-                self,
-                "Sedang berjalan",
-                "Tunggu operasi sync selesai sebelum disconnect.",
-            )
-            return
-
-        if self._connected:
-            reply = QMessageBox.question(
-                self,
-                "Disconnect",
-                "Putuskan koneksi ke server GISNAS?\n\n"
-                "Daftar layer di panel akan dikosongkan. File GPKG lokal tidak dihapus.",
-                MSG_YES | MSG_NO,
-            )
-            if reply != MSG_YES:
-                return
-
-        self.base_url = ""
-        self.token = ""
-        self.collections = []
-        self.list_collections.clear()
-        self._set_connected_state(False)
-        self._log("⏏ Disconnected — siap koneksi baru.")
-
-    def _set_connected_state(self, connected):
-        self._connected = bool(connected)
-        self._apply_ui_state()
-
-    def _set_busy(self, busy):
-        self._busy = bool(busy)
-        self._apply_ui_state()
-
-    def _apply_ui_state(self):
-        busy = self._busy
-        connected = self._connected
-
-        self.btn_connect.setEnabled(not busy and not connected)
-        self.btn_disconnect.setEnabled(not busy and connected)
-        self.url_input.setEnabled(not busy and not connected)
-
-        sync_enabled = not busy and connected
-        self.btn_download.setEnabled(sync_enabled)
-        self.btn_push.setEnabled(sync_enabled)
-        self.btn_refresh.setEnabled(sync_enabled)
-        self.btn_open_folder.setEnabled(not busy)
-        self.btn_rename_layer.setEnabled(sync_enabled)
-        self.btn_delete_layer.setEnabled(sync_enabled)
-        self.btn_import.setEnabled(sync_enabled)
-        self.btn_topo.setEnabled(sync_enabled)
-        self.btn_direct_upload.setEnabled(sync_enabled)
-
-        if connected:
-            host = self.base_url.replace("http://", "").replace("https://", "")
-            self.lbl_conn_status.setText(
-                f"● Terhubung ke {host} — {len(self.collections)} layer"
-            )
-            self.lbl_conn_status.setStyleSheet(
-                "color: #16a34a; font-weight: bold; font-size: 0.85rem;"
-            )
-        else:
-            self.lbl_conn_status.setText("● Belum terhubung")
-            self.lbl_conn_status.setStyleSheet("color: #64748b; font-size: 0.85rem;")
 
     def _refresh_collection_list(self):
         from .sketsa_utils import gpkg_path_for
@@ -377,65 +256,30 @@ class SketsaPanel(QDockWidget):
             item.setData(USER_ROLE + 1, title)
             self.list_collections.addItem(item)
 
-    def _resolve_conflict(self, gpkg_path):
-        from .sketsa_engine import resolve_sync_conflict
-        return resolve_sync_conflict(self, gpkg_path)
-
-    def _start_worker(self, fn, done_slot, *args, **kwargs):
-        self._worker = _Worker(fn, *args, **kwargs)
-        self._worker.log_signal.connect(self._log)
-        self._worker.done_signal.connect(done_slot)
-        self._worker.error_signal.connect(self._on_worker_error)
-        self._worker.start()
-
     # --- Download ---
     def _on_download(self):
-        from .sketsa_engine import pull_collection, prepare_gpkg_for_file_replace
-        from .sketsa_utils import gpkg_path_for
+        from .sketsa_engine import pull_collection
 
         table_name, title = self._get_selected_collection_full()
         if not table_name:
             return
 
-        gpkg_path = gpkg_path_for(self.base_url, self.token, table_name)
-        resolution = self._resolve_conflict(gpkg_path)
-        if resolution == "cancel":
-            return
-
         self._log(f"\n{'='*50}")
         self._log(f"⬇️ DOWNLOAD: {table_name}")
-        self._set_busy(True)
+        self._set_buttons_enabled(False)
 
-        if resolution == "push_first" and os.path.exists(gpkg_path):
-            from .sketsa_engine import push_changes
-
-            def download_after_push(log_fn=None):
-                push_changes(
-                    gpkg_path, self.base_url, self.token, table_name, log_fn=log_fn
-                )
-                return pull_collection(
-                    self.base_url, self.token, table_name, log_fn=log_fn
-                )
-
-            self._start_worker(
-                download_after_push,
-                lambda path: self._on_download_done(path, table_name, title),
-            )
-            return
-
-        prepare_gpkg_for_file_replace(gpkg_path)
-        self._start_worker(
-            pull_collection,
-            lambda path: self._on_download_done(path, table_name, title),
-            self.base_url,
-            self.token,
-            table_name,
+        self._worker = _Worker(
+            pull_collection, self.base_url, self.token, table_name
         )
+        self._worker.log_signal.connect(self._log)
+        self._worker.done_signal.connect(lambda path: self._on_download_done(path, table_name, title))
+        self._worker.error_signal.connect(self._on_worker_error)
+        self._worker.start()
 
     def _on_download_done(self, gpkg_path, table_name, title):
         from .sketsa_engine import release_gpkg_layers
 
-        self._set_busy(False)
+        self._set_buttons_enabled(True)
         self._refresh_collection_list()
 
         release_gpkg_layers(gpkg_path)
@@ -483,7 +327,7 @@ class SketsaPanel(QDockWidget):
 
         self._log(f"\n{'='*50}")
         self._log(f"⬆️ PUSH: {table_name}")
-        self._set_busy(True)
+        self._set_buttons_enabled(False)
 
         self._worker = _Worker(
             push_changes, gpkg_path, self.base_url, self.token, table_name
@@ -494,60 +338,15 @@ class SketsaPanel(QDockWidget):
         self._worker.start()
 
     def _on_push_done(self, results):
-        self._set_busy(False)
+        self._set_buttons_enabled(True)
         self._refresh_collection_list()
 
         # Reload QGIS layer to reflect new IDs
         self._reload_active_layer()
 
-    def _on_open_folder(self):
-        from .sketsa_utils import (
-            open_local_folder,
-            gpkg_dir_for,
-            gpkg_path_for,
-            get_sketsa_dir,
-        )
-        if not self.base_url or not self.token:
-            root = get_sketsa_dir()
-            self._log(f"📂 Membuka folder utama Sketsa:\n   {root}")
-            open_local_folder(root)
-            return
-
-        table_name = self._get_selected_collection()
-        folder = gpkg_dir_for(self.base_url, self.token)
-
-        if table_name:
-            gpkg_path = gpkg_path_for(self.base_url, self.token, table_name)
-            if os.path.exists(gpkg_path):
-                self._log(f"📂 Folder layer '{table_name}':")
-                self._log(f"   {folder}")
-                self._log(f"   File: {os.path.basename(gpkg_path)}")
-            else:
-                self._log(f"📂 Folder layer (belum diunduh) '{table_name}':")
-                self._log(f"   {folder}")
-        else:
-            self._log("📂 Folder koneksi (pilih layer untuk lihat file .gpkg spesifik):")
-            self._log(f"   {folder}")
-
-        open_local_folder(folder)
-
-        if table_name:
-            gpkg_path = gpkg_path_for(self.base_url, self.token, table_name)
-            if os.path.exists(gpkg_path):
-                QMessageBox.information(
-                    self,
-                    "Folder data lokal",
-                    f"Folder:\n{folder}\n\n"
-                    f"File layer ini:\n{os.path.basename(gpkg_path)}\n\n"
-                    "Untuk unduh ulang dari server:\n"
-                    "1. Hapus layer dari peta QGIS (Remove Layer)\n"
-                    "2. Hapus file .gpkg di folder ini (opsional)\n"
-                    "3. Klik Download di panel Sketsa",
-                )
-
     # --- Refresh ---
     def _on_refresh(self):
-        from .sketsa_engine import refresh_from_server, prepare_gpkg_for_file_replace
+        from .sketsa_engine import refresh_from_server
         from .sketsa_utils import gpkg_path_for
 
         table_name = self._get_selected_collection()
@@ -559,68 +358,32 @@ class SketsaPanel(QDockWidget):
             QMessageBox.warning(self, "Error", "Layer has not been downloaded.")
             return
 
-        resolution = self._resolve_conflict(gpkg_path)
-        if resolution == "cancel":
+        confirm = QMessageBox.question(
+            self, "Confirmation",
+            "Refresh will overwrite local data with server data.\n"
+            "Unpushed local changes will be lost.\n\n"
+            "Continue?",
+            MSG_YES | MSG_NO,
+        )
+        if confirm != MSG_YES:
             return
 
         self._log(f"\n{'='*50}")
         self._log(f"🔄 REFRESH: {table_name}")
-        self._set_busy(True)
+        self._set_buttons_enabled(False)
 
-        if resolution == "push_first":
-            from .sketsa_engine import push_changes
-
-            def refresh_after_push(log_fn=None):
-                push_changes(
-                    gpkg_path, self.base_url, self.token, table_name, log_fn=log_fn
-                )
-                refresh_from_server(
-                    gpkg_path,
-                    self.base_url,
-                    self.token,
-                    table_name,
-                    log_fn=log_fn,
-                    use_gpkg=True,
-                )
-
-            self._start_worker(refresh_after_push, lambda _: self._on_refresh_done())
-            return
-
-        prepare_gpkg_for_file_replace(gpkg_path)
-
-        def do_refresh(log_fn=None):
-            # GPKG utuh = lepas lock file, hindari WinError 32 setelah layer dibuka
-            refresh_from_server(
-                gpkg_path,
-                self.base_url,
-                self.token,
-                table_name,
-                log_fn=log_fn,
-                use_gpkg=True,
-            )
-
-        self._start_worker(do_refresh, lambda _: self._on_refresh_done())
+        self._worker = _Worker(
+            refresh_from_server, gpkg_path, self.base_url, self.token, table_name
+        )
+        self._worker.log_signal.connect(self._log)
+        self._worker.done_signal.connect(lambda _: self._on_refresh_done())
+        self._worker.error_signal.connect(self._on_worker_error)
+        self._worker.start()
 
     def _on_refresh_done(self):
-        self._set_busy(False)
+        self._set_buttons_enabled(True)
         self._refresh_collection_list()
-        table_name = self._get_selected_collection()
-        if table_name:
-            from .sketsa_utils import gpkg_path_for
-            from .sketsa_engine import release_gpkg_layers
-
-            gpkg_path = gpkg_path_for(self.base_url, self.token, table_name)
-            release_gpkg_layers(gpkg_path)
-            _, title = self._get_selected_collection_full()
-            uri = f"{gpkg_path}|layername=layer_data"
-            layer = QgsVectorLayer(uri, title or table_name, "ogr")
-            if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
-                self._log("🗺️ Layer dimuat ulang setelah refresh.")
-            else:
-                self._reload_active_layer()
-        else:
-            self._reload_active_layer()
+        self._reload_active_layer()
 
     # --- Delete layer ---
     def _on_rename_layer(self):
@@ -670,7 +433,7 @@ class SketsaPanel(QDockWidget):
 
         self._log(f"\n{'='*50}")
         self._log(f"🗑️ DELETE LAYER: {table_name}")
-        self._set_busy(True)
+        self._set_buttons_enabled(False)
 
         release_gpkg_layers(gpkg_path)
         self._worker = _Worker(
@@ -686,7 +449,7 @@ class SketsaPanel(QDockWidget):
         self._worker.start()
 
     def _on_delete_layer_done(self, _result):
-        self._set_busy(False)
+        self._set_buttons_enabled(True)
         self._on_connect()
 
     # --- Import ---
@@ -741,8 +504,20 @@ class SketsaPanel(QDockWidget):
             self._log(f"🚀 Upload langsung selesai!")
             self._on_connect()
 
+    # --- Helpers ---
+    def _set_buttons_enabled(self, enabled):
+        self.btn_connect.setEnabled(enabled)
+        self.btn_download.setEnabled(enabled)
+        self.btn_push.setEnabled(enabled)
+        self.btn_refresh.setEnabled(enabled)
+        self.btn_rename_layer.setEnabled(enabled)
+        self.btn_delete_layer.setEnabled(enabled)
+        self.btn_import.setEnabled(enabled)
+        self.btn_topo.setEnabled(enabled)
+        self.btn_direct_upload.setEnabled(enabled)
+
     def _on_worker_error(self, error_msg):
-        self._set_busy(False)
+        self._set_buttons_enabled(True)
         self._log(f"❌ Error: {error_msg}")
         QMessageBox.critical(self, "Error", error_msg)
 

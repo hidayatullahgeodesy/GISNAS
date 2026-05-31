@@ -51,44 +51,13 @@ def get_sketsa_dir():
     return str(sketsa_dir)
 
 
-def gpkg_dir_for(base_url, token):
-    """Folder penyimpanan GPKG untuk koneksi (host + token) ini."""
+def gpkg_path_for(base_url, token, table_name):
+    """Return the GPKG file path for a specific collection."""
     host = base_url.split("//")[1].replace(":", "_").replace("/", "_")
     token_prefix = token[:16] if len(token) > 16 else token
     dir_path = os.path.join(get_sketsa_dir(), host, token_prefix)
     os.makedirs(dir_path, exist_ok=True)
-    return dir_path
-
-
-def gpkg_path_for(base_url, token, table_name):
-    """Return the GPKG file path for a specific collection."""
-    return os.path.join(gpkg_dir_for(base_url, token), f"{table_name}.gpkg")
-
-
-def open_local_folder(folder_path):
-    """Buka folder di Explorer/Finder (dari QGIS di Windows/Linux/macOS)."""
-    folder_path = os.path.abspath(folder_path)
-    if not os.path.isdir(folder_path):
-        os.makedirs(folder_path, exist_ok=True)
-
-    try:
-        from qgis.PyQt.QtCore import QUrl
-        from qgis.PyQt.QtGui import QDesktopServices
-        if QDesktopServices.openUrl(QUrl.fromLocalFile(folder_path)):
-            return folder_path
-    except Exception:
-        pass
-
-    import platform
-    import subprocess
-
-    if platform.system() == "Windows":
-        os.startfile(folder_path)
-    elif platform.system() == "Darwin":
-        subprocess.Popen(["open", folder_path])
-    else:
-        subprocess.Popen(["xdg-open", folder_path])
-    return folder_path
+    return os.path.join(dir_path, f"{table_name}.gpkg")
 
 
 def meta_path_for(base_url, token):
@@ -290,8 +259,6 @@ def _json_default(obj):
 
 def api_post(url, data):
     """HTTP POST with JSON body → parsed JSON."""
-    import urllib.error
-
     body = json.dumps(data, default=_json_default).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -299,13 +266,9 @@ def api_post(url, data):
         headers={"Content-Type": "application/json", "User-Agent": "GISNAS-Sketsa/1.0"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {"status": resp.status}
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise Exception(f"HTTP {e.code}: {err_body}") from e
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw.strip() else {"status": resp.status}
 
 
 def api_put(url, data):

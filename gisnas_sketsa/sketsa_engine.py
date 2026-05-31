@@ -66,9 +66,11 @@ def pull_collection(base_url, token, table_name, log_fn=None):
     log(f"📥 Mengunduh GPKG utuh dari server (Cepat): {table_name}...")
 
     try:
-        prepare_gpkg_for_file_replace(gpkg_path)
+        release_gpkg_layers(gpkg_path)
         api_download_file(url_download, tmp_path)
-        safe_replace_gpkg_file(gpkg_path, tmp_path)
+        if os.path.exists(gpkg_path):
+            os.remove(gpkg_path)
+        os.replace(tmp_path, gpkg_path)
     except Exception as e:
         if os.path.exists(tmp_path):
             try:
@@ -105,6 +107,7 @@ def pull_collection(base_url, token, table_name, log_fn=None):
 
     _normalize_layer_schema(conn)
     _ensure_tracking_tables(conn)
+    _drop_spatialite_triggers(conn)  # Hapus trigger ST_IsEmpty agar edit di QGIS tidak error
 
     # Snapshot tanpa CREATE AS SELECT (hindari trigger SpatiaLite ST_IsEmpty)
     log("📸 Membuat snapshot baseline...")
@@ -138,7 +141,6 @@ def pull_collection(base_url, token, table_name, log_fn=None):
     conn.commit()
     conn.close()
 
-    strip_spatialite_triggers(gpkg_path, log_fn=log)
     log(f"✅ Download selesai! File GPKG berhasil diperbarui secara lokal.")
     return gpkg_path
 
@@ -158,7 +160,6 @@ def push_changes(gpkg_path, base_url, token, table_name, log_fn=None):
         if log_fn:
             log_fn(msg)
 
-    strip_spatialite_triggers(gpkg_path, log_fn=log)
     log("🔍 Menghitung perubahan lokal (diff)...")
     diff = compute_diff(gpkg_path)
 
@@ -211,11 +212,9 @@ def push_changes(gpkg_path, base_url, token, table_name, log_fn=None):
         log(f"   ➕ Menambah feature baru...")
         try:
             url = build_url(base_url, token, "collections", table_name, "items")
-            geojson = _feature_dict_to_geojson(feat)
+            geojson = _feature_dict_to_geojson(feat, gpkg_path=gpkg_path)
             if not geojson.get("geometry"):
-                raise ValueError(
-                    "Geometri kosong — simpan layer di QGIS (Ctrl+S) lalu push lagi"
-                )
+                raise ValueError("Geometri kosong — tidak bisa dikirim ke server")
             resp = api_post(url, geojson)
             new_id = resp.get("id")
             if new_id and feat.get("_local_fid"):
@@ -245,20 +244,16 @@ def push_changes(gpkg_path, base_url, token, table_name, log_fn=None):
     # 5. Update local GPKG: assign server IDs to new features
     if id_map:
         conn = sqlite3.connect(gpkg_path)
-        _drop_all_triggers_on_table(conn, "layer_data")
-        try:
-            for local_fid, server_id in id_map.items():
-                conn.execute(
-                    "UPDATE layer_data SET id = ? WHERE fid = ?",
-                    (server_id, local_fid),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        for local_fid, server_id in id_map.items():
+            conn.execute(
+                "UPDATE layer_data SET id = ? WHERE fid = ?",
+                (server_id, local_fid),
+            )
+        conn.commit()
+        conn.close()
 
     # 6. Refresh snapshot
     log("📸 Memperbarui snapshot...")
-    strip_spatialite_triggers(gpkg_path)
     _create_snapshot(gpkg_path)
 
     # Update schema snapshot
@@ -277,11 +272,6 @@ def push_changes(gpkg_path, base_url, token, table_name, log_fn=None):
 
     total = results["success"] + results["errors"]
     log(f"✅ Push selesai: {results['success']}/{total} berhasil")
-    if results["errors"] > 0 and results["success"] == 0:
-        detail = "\n".join(results["details"][:8]) or "Semua operasi push gagal"
-        raise Exception(detail)
-    if results["errors"] > 0:
-        log("⚠️ Beberapa operasi gagal — lihat detail di atas")
     return results
 
 
@@ -406,22 +396,13 @@ def compute_diff(gpkg_path):
 # REFRESH — Re-download from server
 # ---------------------------------------------------------------------------
 
-def refresh_from_server(gpkg_path, base_url, token, table_name, log_fn=None, use_gpkg=False):
-    """Re-download all data from server, replacing local data + snapshot.
-
-  use_gpkg=True: unduh GPKG utuh (lebih aman di Windows, sama seperti Download).
-    """
+def refresh_from_server(gpkg_path, base_url, token, table_name, log_fn=None):
+    """Re-download all data from server, replacing local data + snapshot."""
     def log(msg):
         if log_fn:
             log_fn(msg)
 
-    if use_gpkg:
-        log(f"🔄 Refresh via unduhan GPKG utuh: {table_name}...")
-        pull_collection(base_url, token, table_name, log_fn=log_fn)
-        return
-
     log(f"🔄 Refreshing {table_name} dari server...")
-    prepare_gpkg_for_file_replace(gpkg_path)
 
     columns = _fetch_columns(base_url, token, table_name)
     features = _fetch_all_items(base_url, token, table_name)
@@ -445,6 +426,7 @@ def refresh_from_server(gpkg_path, base_url, token, table_name, log_fn=None, use
     if features:
         _insert_features_to_gpkg(gpkg_path, features, columns)
     _normalize_layer_schema_on_path(gpkg_path)
+    _drop_spatialite_triggers_on_path(gpkg_path)  # Hapus trigger ST_IsEmpty agar edit di QGIS tidak error
     _create_snapshot(gpkg_path)
     save_schema_snapshot(gpkg_path, columns)
 
@@ -522,163 +504,45 @@ def release_gpkg_layers(gpkg_path):
     try:
         from qgis.core import QgsProject
     except ImportError:
-        return 0
+        return
 
     norm = os.path.normpath(gpkg_path).lower()
-    base = os.path.basename(norm)
     to_remove = []
     for layer in QgsProject.instance().mapLayers().values():
         try:
             if layer.providerType() != "ogr":
                 continue
-            src_raw = (layer.source() or "").split("|")[0]
-            src = os.path.normpath(src_raw).lower()
-            if src == norm or src.endswith(base) or base in src:
+            src = os.path.normpath(layer.source().split("|")[0]).lower()
+            if src == norm:
                 to_remove.append(layer.id())
         except Exception:
             continue
     for lid in to_remove:
         QgsProject.instance().removeMapLayer(lid)
 
-    try:
-        from qgis.PyQt.QtWidgets import QApplication
-        QApplication.processEvents()
-    except Exception:
-        pass
-    return len(to_remove)
 
+def _drop_spatialite_triggers(conn):
+    """Hapus trigger SpatiaLite yang pakai ST_IsEmpty — tidak tersedia di SQLite murni.
 
-def prepare_gpkg_for_file_replace(gpkg_path):
-    """Lepas layer + beri waktu agar Windows melepas lock file GPKG."""
-    import gc
-    import time
-
-    release_gpkg_layers(gpkg_path)
-    gc.collect()
-    try:
-        from qgis.PyQt.QtWidgets import QApplication
-        QApplication.processEvents()
-    except Exception:
-        pass
-    time.sleep(0.35)
-
-
-def safe_replace_gpkg_file(gpkg_path, tmp_path, max_retries=10):
-    """Ganti file GPKG dengan retry (Windows sering WinError 32)."""
-    import gc
-    import time
-
-    if not os.path.exists(tmp_path):
-        raise Exception("Unduhan GPKG gagal: file sementara tidak ada.")
-
-    prepare_gpkg_for_file_replace(gpkg_path)
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            if os.path.exists(gpkg_path):
-                os.remove(gpkg_path)
-            os.replace(tmp_path, gpkg_path)
-            return
-        except OSError as e:
-            last_err = e
-            prepare_gpkg_for_file_replace(gpkg_path)
-            gc.collect()
-            time.sleep(0.4 * (attempt + 1))
-
-    raise Exception(
-        "File GPKG masih dikunci proses lain (WinError 32).\n\n"
-        "Langkah:\n"
-        "1. Hapus layer ini dari peta QGIS (klik kanan → Remove Layer)\n"
-        "2. Tutup panel atribut / browser yang membuka file yang sama\n"
-        "3. Klik Download / Refresh lagi\n\n"
-        f"File: {gpkg_path}\nDetail: {last_err}"
-    )
-
-
-def resolve_sync_conflict(parent, gpkg_path):
-    """Dialog konflik: ada perubahan lokal vs unduh ulang dari server.
-
-    Returns: 'discard' | 'push_first' | 'cancel'
+    Trigger ini dibuat otomatis oleh OGR/SpatiaLite saat membuat GPKG, tapi
+    karena QGIS plugin ini jalan di SQLite tanpa SpatiaLite extension, trigger
+    ini menyebabkan error 'no such function: ST_IsEmpty' saat user menambah/
+    mengedit feature.
     """
-    try:
-        if get_sync_status(gpkg_path) != "modified":
-            return "discard"
-    except Exception:
-        return "discard"
-
-    try:
-        from qgis.PyQt.QtWidgets import QMessageBox
-        try:
-            btn_push = QMessageBox.StandardButton.Yes
-            btn_discard = QMessageBox.StandardButton.No
-            btn_cancel = QMessageBox.StandardButton.Cancel
-        except AttributeError:
-            btn_push = QMessageBox.Yes
-            btn_discard = QMessageBox.No
-            btn_cancel = QMessageBox.Cancel
-
-        box = QMessageBox(parent)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Konflik sinkronisasi")
-        box.setText("Ada perubahan lokal yang belum di-push ke server.")
-        box.setInformativeText(
-            "Unduh ulang / refresh akan menimpa data lokal.\n\n"
-            "• Push dulu — kirim perubahan lokal ke server, lalu lanjut\n"
-            "• Buang lokal — pakai data server (perubahan lokal hilang)\n"
-            "• Batal"
-        )
-        box.setStandardButtons(btn_push | btn_discard | btn_cancel)
-        try:
-            box.setButtonText(btn_push, "Push dulu")
-            box.setButtonText(btn_discard, "Buang lokal & lanjut")
-            box.setButtonText(btn_cancel, "Batal")
-        except Exception:
-            pass
-        box.setDefaultButton(btn_push)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked == box.button(btn_push):
-            return "push_first"
-        if clicked == box.button(btn_discard):
-            return "discard"
-        return "cancel"
-    except Exception:
-        return "discard"
-
-
-def _drop_all_triggers_on_table(conn, table):
-    """Hapus semua trigger SQLite pada tabel (perbaikan ST_IsEmpty di GPKG QGIS)."""
-    rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
-        (table,),
+    triggers = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
     ).fetchall()
-    for (name,) in rows:
-        conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-    return len(rows)
-
-
-def strip_spatialite_triggers(gpkg_path, log_fn=None):
-    """Hapus trigger SpatiaLite bermasalah (ST_IsEmpty) dari GPKG lokal."""
-    conn = sqlite3.connect(gpkg_path)
-    total = 0
-    for (tbl,) in conn.execute(
-        "SELECT DISTINCT tbl_name FROM sqlite_master WHERE type='trigger' AND tbl_name IS NOT NULL"
-    ).fetchall():
-        if not tbl:
-            continue
-        for name, sql in conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
-            (tbl,),
-        ).fetchall():
-            if sql and "ST_IsEmpty" in sql:
-                conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-                total += 1
-    total += _drop_all_triggers_on_table(conn, "layer_data")
+    for name, sql in triggers:
+        if sql and "ST_IsEmpty" in sql:
+            conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
     conn.commit()
+
+
+def _drop_spatialite_triggers_on_path(gpkg_path):
+    """Versi path dari _drop_spatialite_triggers."""
+    conn = sqlite3.connect(gpkg_path)
+    _drop_spatialite_triggers(conn)
     conn.close()
-    if log_fn and total:
-        log_fn(f"   🔧 Trigger GPKG dihapus ({total}) — hindari error ST_IsEmpty")
-    return total
 
 
 def _disable_table_triggers(conn, table):
@@ -697,8 +561,6 @@ def _disable_table_triggers(conn, table):
 def _restore_triggers(conn, saved):
     for _name, sql in saved:
         try:
-            if sql and "ST_IsEmpty" in sql:
-                continue
             conn.execute(sql)
         except Exception:
             pass
@@ -746,7 +608,7 @@ def _normalize_layer_schema(conn):
     - FID=id (lama): kolom id ada, fid tidak → tambah fid
     - FID=fid (baru): nilai server di fid, id tidak ada → tambah id dari fid
     """
-    _drop_all_triggers_on_table(conn, "layer_data")
+    saved = _disable_table_triggers(conn, "layer_data")
     try:
         layer_cols = _table_column_names(conn, "layer_data")
 
@@ -769,7 +631,7 @@ def _normalize_layer_schema(conn):
             conn.execute("ALTER TABLE _sketsa_snapshot ADD COLUMN id INTEGER")
             conn.execute("UPDATE _sketsa_snapshot SET id = fid")
     finally:
-        pass
+        _restore_triggers(conn, saved)
 
     conn.commit()
 
@@ -868,7 +730,7 @@ def _create_snapshot(gpkg_path):
 
     cols_str = ", ".join([f'"{c}"' for c in col_names])
 
-    _drop_all_triggers_on_table(conn, "layer_data")
+    saved = _disable_table_triggers(conn, "layer_data")
     try:
         conn.execute("DELETE FROM _sketsa_snapshot")
         snap_cols = {
@@ -888,18 +750,13 @@ def _create_snapshot(gpkg_path):
                 except Exception:
                     pass
 
-        placeholders = ", ".join(["?"] * len(col_names))
-        rows = conn.execute(
-            f'SELECT {cols_str} FROM layer_data'
-        ).fetchall()
-        if rows:
-            conn.executemany(
-                f"INSERT INTO _sketsa_snapshot ({cols_str}) VALUES ({placeholders})",
-                rows,
-            )
+        conn.execute(
+            f"INSERT INTO _sketsa_snapshot ({cols_str}) "
+            f"SELECT {cols_str} FROM layer_data"
+        )
         conn.commit()
     finally:
-        pass
+        _restore_triggers(conn, saved)
     conn.close()
 
 
@@ -958,34 +815,14 @@ def _gpkg_blob_to_geojson_geometry(geom_blob):
 
 
 def _read_geometry_from_gpkg(gpkg_path, fid=None, server_id=None):
-    """Baca geometri via OGR (fallback jika blob dari diff tidak cukup)."""
+    """Baca geometri via OGR — cara paling andal untuk file GPKG di QGIS."""
     from osgeo import ogr
-
-    # Lepas trigger SpatiaLite sementara — beberapa GPKG GISNAS memicu ST_IsEmpty.
-    try:
-        conn = sqlite3.connect(gpkg_path)
-        saved = _disable_table_triggers(conn, "layer_data")
-        conn.close()
-    except Exception:
-        saved = None
-
-    def _restore_saved_triggers():
-        if saved is not None:
-            try:
-                c = sqlite3.connect(gpkg_path)
-                _restore_triggers(c, saved)
-                c.close()
-            except Exception:
-                pass
 
     ds = ogr.Open(gpkg_path)
     if not ds:
-        _restore_saved_triggers()
         return None
     lyr = ds.GetLayerByName("layer_data")
     if not lyr:
-        ds = None
-        _restore_saved_triggers()
         return None
 
     feat = None
@@ -1002,16 +839,11 @@ def _read_geometry_from_gpkg(gpkg_path, fid=None, server_id=None):
             lyr.SetAttributeFilter(None)
 
     if not feat:
-        ds = None
-        _restore_saved_triggers()
         return None
     geom = feat.GetGeometryRef()
-    result = None
     if geom and not geom.IsEmpty():
-        result = json.loads(geom.ExportToJson())
-    ds = None
-    _restore_saved_triggers()
-    return result
+        return json.loads(geom.ExportToJson())
+    return None
 
 
 def _feature_dict_to_geojson(feat_dict, gpkg_path=None):
@@ -1022,18 +854,16 @@ def _feature_dict_to_geojson(feat_dict, gpkg_path=None):
         "properties": {},
     }
 
-    # Utamakan blob dari diff (SELECT fid,* layer_data) — hindari OGR/SQLite trigger
-    # SpatiaLite di GPKG yang memanggil ST_IsEmpty (sering tidak terdaftar di QGIS).
-    geom_blob = feat_dict.get("_geom_blob") or feat_dict.get("geom")
-    if geom_blob:
-        geojson["geometry"] = _gpkg_blob_to_geojson_geometry(geom_blob)
-
-    if not geojson["geometry"] and gpkg_path:
+    if gpkg_path:
         geojson["geometry"] = _read_geometry_from_gpkg(
             gpkg_path,
             fid=feat_dict.get("fid"),
             server_id=feat_dict.get("id"),
         )
+
+    if not geojson["geometry"]:
+        geom_blob = feat_dict.get("_geom_blob") or feat_dict.get("geom")
+        geojson["geometry"] = _gpkg_blob_to_geojson_geometry(geom_blob)
 
     skip = ("fid", "geom", "id", "_local_fid", "_geom_blob", "create_gn", "update_gn")
     for key, val in feat_dict.items():
@@ -1132,4 +962,3 @@ def upload_layer_to_server(layer, base_url, token, display_name=None):
         "table_name": table_name,
         "feature_count": resp.get("feature_count", 0),
     }
-
