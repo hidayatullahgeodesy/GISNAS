@@ -22,9 +22,13 @@ def parse_ogc_url(url):
     Supported formats:
         http://host/token/TOKEN/api/ogc/features
         http://host/api/ogc/features?token=TOKEN
+        https://host/...
     Returns (base_url, token) tuple.
     """
     url = url.strip().rstrip("/")
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
     parts = url.split("/")
     token = ""
     for i, p in enumerate(parts):
@@ -244,11 +248,62 @@ def _pg_type_to_sqlite(pg_type):
 # HTTP Helpers
 # ---------------------------------------------------------------------------
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36 GISNAS-Sketsa/1.0"
+)
+
+
+class PreserveMethodRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Ensure HTTP 301/302/307/308 redirects from Cloudflare/Nginx preserve the HTTP method (PUT, POST, PATCH, DELETE) and data."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        m = req.get_method()
+        if code in (301, 302, 307, 308):
+            new_headers = dict(req.headers)
+            new_headers.update(dict(req.unredirected_hdrs))
+            return urllib.request.Request(
+                newurl,
+                headers=new_headers,
+                data=req.data,
+                method=m,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(PreserveMethodRedirectHandler())
+
+
+def _format_http_error(e):
+    err_body = ""
+    try:
+        err_body = e.read().decode("utf-8", errors="replace")
+    except Exception:
+        pass
+
+    lower = err_body.lower()
+    if e.code == 403:
+        if "cloudflare" in lower or "turnstile" in lower or "challenge" in lower or "just a moment" in lower:
+            return (
+                "HTTP 403: Dihadang proteksi Cloudflare WAF / Bot Fight Mode. "
+                "Silakan tambahkan Custom Rule Bypass di Cloudflare untuk path '/api/*' dan '/token/*'."
+            )
+        return f"HTTP 403 Forbidden: Akses ditolak oleh server/Cloudflare. {err_body[:200]}"
+    if e.code == 413:
+        return "HTTP 413: Ukuran data terlalu besar (ditolak oleh batasan client_max_body_size Nginx atau Cloudflare)."
+    if e.code == 524:
+        return "HTTP 524: Cloudflare Timeout (backend melebihi batas waktu 100 detik)."
+
+    return f"HTTP {e.code}: {err_body}" if err_body else f"HTTP {e.code}"
+
+
 def api_get(url):
     """HTTP GET → parsed JSON."""
-    req = urllib.request.Request(url, headers={"User-Agent": "GISNAS-Sketsa/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    try:
+        with _opener.open(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise Exception(_format_http_error(e)) from e
 
 
 def _json_default(obj):
@@ -263,12 +318,15 @@ def api_post(url, data):
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "GISNAS-Sketsa/1.0"},
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw.strip() else {"status": resp.status}
+    try:
+        with _opener.open(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {"status": resp.status}
+    except urllib.error.HTTPError as e:
+        raise Exception(_format_http_error(e)) from e
 
 
 def api_put(url, data):
@@ -277,24 +335,26 @@ def api_put(url, data):
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "GISNAS-Sketsa/1.0"},
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT},
         method="PUT",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _opener.open(req, timeout=60) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise Exception(f"HTTP {e.code}: {err_body}") from e
+        raise Exception(_format_http_error(e)) from e
 
 
 def api_delete(url):
     """HTTP DELETE → status code."""
     req = urllib.request.Request(
-        url, headers={"User-Agent": "GISNAS-Sketsa/1.0"}, method="DELETE"
+        url, headers={"User-Agent": DEFAULT_USER_AGENT}, method="DELETE"
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return resp.status
+    try:
+        with _opener.open(req, timeout=60) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        raise Exception(_format_http_error(e)) from e
 
 
 def api_patch(url, data):
@@ -303,28 +363,26 @@ def api_patch(url, data):
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "GISNAS-Sketsa/1.0"},
+        headers={"Content-Type": "application/json", "User-Agent": DEFAULT_USER_AGENT},
         method="PATCH",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _opener.open(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw.strip() else {"status": resp.status}
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise Exception(f"HTTP {e.code}: {err_body}") from e
+        raise Exception(_format_http_error(e)) from e
 
 
 def build_url(base_url, token, *path_parts):
     """Build a full GISNAS API URL with token in both path and query."""
+    base_url = (base_url or "").strip().rstrip("/")
     path = "/".join(str(p) for p in path_parts)
     return f"{base_url}/token/{token}/api/ogc/features/{path}?token={token}"
 
 
 def api_post_file(url, file_path, layer_name=None, upload_filename=None):
-    import urllib.request
     import uuid
-    import os
 
     boundary = uuid.uuid4().hex
     filename = upload_filename or os.path.basename(file_path)
@@ -349,20 +407,24 @@ def api_post_file(url, file_path, layer_name=None, upload_filename=None):
         data=body,
         headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "GISNAS-Sketsa/1.0"
+            "User-Agent": DEFAULT_USER_AGENT,
         },
         method="POST",
     )
-    
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        raw = resp.read().decode("utf-8")
-        import json
-        return json.loads(raw) if raw.strip() else {"status": resp.status}
+    try:
+        with _opener.open(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {"status": resp.status}
+    except urllib.error.HTTPError as e:
+        raise Exception(_format_http_error(e)) from e
+
 
 def api_download_file(url, target_path):
-    import urllib.request
     import shutil
-    
-    req = urllib.request.Request(url, headers={"User-Agent": "GISNAS-Sketsa/1.0"})
-    with urllib.request.urlopen(req, timeout=300) as resp, open(target_path, 'wb') as out_file:
-        shutil.copyfileobj(resp, out_file)
+
+    req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    try:
+        with _opener.open(req, timeout=300) as resp, open(target_path, 'wb') as out_file:
+            shutil.copyfileobj(resp, out_file)
+    except urllib.error.HTTPError as e:
+        raise Exception(_format_http_error(e)) from e

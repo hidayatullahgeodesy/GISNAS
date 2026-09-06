@@ -218,7 +218,16 @@ class SketsaPanel(QDialog):
         self._log(f"🔌 Connecting to {self.base_url}...")
         try:
             coll_url = build_url(self.base_url, self.token, "collections")
-            data = api_get(coll_url)
+            import urllib.request, json
+            from .sketsa_utils import DEFAULT_USER_AGENT, _opener, _format_http_error
+            req = urllib.request.Request(coll_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+            with _opener.open(req, timeout=60) as resp:
+                final_url = resp.geturl()
+                if final_url.startswith("https://") and self.base_url.startswith("http://"):
+                    self.base_url = "https://" + self.base_url[len("http://"):]
+                    self._log(f"🔒 Auto-upgraded connection to HTTPS: {self.base_url}")
+                raw = resp.read().decode("utf-8")
+                data = json.loads(raw) if raw.strip() else {}
             self.collections = data.get("collections", [])
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Connection failed: {e}")
@@ -1060,14 +1069,12 @@ class HistoryDialog(QDialog):
         self._load_history()
         
     def _load_history(self):
-        url = f"{self.base_url}/collections/{self.table_name}/history"
-        if self.token:
-            url += f"?token={self.token}"
-            
+        from .sketsa_utils import DEFAULT_USER_AGENT, _opener, build_url
+        url = build_url(self.base_url, self.token, "collections", self.table_name, "history")
         import urllib.request, json
-        req = urllib.request.Request(url, headers={"User-Agent": "GISNAS-Sketsa"})
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _opener.open(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 self.history_data = data
                 self.table.setRowCount(len(data))
@@ -1414,14 +1421,12 @@ class CustomAttributeTableDialog(QDialog):
         self._populate_table()
         
     def _fetch_history(self):
-        url = f"{self.base_url}/collections/{self.table_name}/history"
-        if self.token:
-            url += f"?token={self.token}"
-            
+        from .sketsa_utils import DEFAULT_USER_AGENT, _opener, build_url
+        url = build_url(self.base_url, self.token, "collections", self.table_name, "history")
         import urllib.request, json
-        req = urllib.request.Request(url, headers={"User-Agent": "GISNAS-Sketsa"})
+        req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _opener.open(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 # Simpan riwayat terbaru untuk setiap feature_id
                 for row in reversed(data): 

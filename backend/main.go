@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -70,6 +71,7 @@ type Dataset struct {
 	FillColor   string    `json:"fill_color"`
 	StrokeColor string    `json:"stroke_color"`
 	BBox        []float64 `json:"bbox"`
+	Version     int64     `json:"version"`
 }
 
 type Styling struct {
@@ -1193,12 +1195,11 @@ func createBlankDatasetHandler(w http.ResponseWriter, r *http.Request) {
 	
 	columnsSQL := ""
 	for _, col := range req.Columns {
-		safeColName := sanitizeIdentifier(col.Name)
-		if safeColName == "" {
+		if col.Name == "" || isReservedFeatureColumn(col.Name) {
 			continue
 		}
 		safeType := mapColumnType(col.Type)
-		columnsSQL += fmt.Sprintf(", %s %s", safeColName, safeType)
+		columnsSQL += fmt.Sprintf(", %s %s", quoteIdentifier(col.Name), safeType)
 	}
 
 	createTableQuery := fmt.Sprintf(`
@@ -1242,6 +1243,34 @@ func sanitizeIdentifier(s string) string {
 		}
 	}
 	return string(res)
+}
+
+func quoteIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func findPropertyCaseInsensitive(props map[string]interface{}, colName string) (interface{}, bool) {
+	if props == nil {
+		return nil, false
+	}
+	if v, ok := props[colName]; ok {
+		return v, true
+	}
+	colLower := strings.ToLower(colName)
+	for k, v := range props {
+		if strings.ToLower(k) == colLower {
+			return v, true
+		}
+	}
+	colSanitized := sanitizeIdentifier(colLower)
+	if colSanitized != "" {
+		for k, v := range props {
+			if sanitizeIdentifier(strings.ToLower(k)) == colSanitized {
+				return v, true
+			}
+		}
+	}
+	return nil, false
 }
 
 // Kolom yang dikelola server / GPKG, bukan input client saat insert-update.
@@ -1442,6 +1471,7 @@ func getDatasetsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		d.Version = getDatasetVersion(d.TableName)
 		datasets = append(datasets, d)
 	}
 	if datasets == nil { datasets = []Dataset{} }
@@ -1491,10 +1521,12 @@ func getDatasetDataHandler(w http.ResponseWriter, r *http.Request) {
 
 	selectCols := []string{"ST_AsText(ST_Transform(geom, 4326)) as geom_wkt"}
 	for _, c := range columns {
-		selectCols = append(selectCols, fmt.Sprintf(`"%s"`, sanitizeIdentifier(c)))
+		if c != "" && c != "geom" {
+			selectCols = append(selectCols, quoteIdentifier(c))
+		}
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM %s ORDER BY id ASC LIMIT 500", strings.Join(selectCols, ", "), safeTable)
+	query := fmt.Sprintf("SELECT %s FROM %s ORDER BY id ASC LIMIT 500", strings.Join(selectCols, ", "), quoteIdentifier(safeTable))
 	rows, err := db.Query(query)
 	if err != nil {
 		log.Printf("dataset data query error: %v (table=%s)", err, safeTable)
@@ -1667,23 +1699,32 @@ func insertDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, _, dbCols, err := getTableMeta(tableName)
+	if err != nil {
+		http.Error(w, "Tabel tidak ditemukan: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	cols := []string{"geom"}
 	vals := []interface{}{req.GeomWKT, srid}
 	placeholders := []string{"ST_GeomFromText($1, $2)"}
 
 	paramIdx := 3
-	for k, v := range req.Attributes {
-		safeK := sanitizeIdentifier(k)
-		if safeK == "" || isReservedFeatureColumn(safeK) {
+	for _, col := range dbCols {
+		if isReservedFeatureColumn(col) || col == "geom" {
 			continue
 		}
-		cols = append(cols, safeK)
+		val, ok := findPropertyCaseInsensitive(req.Attributes, col)
+		if !ok || val == nil {
+			continue
+		}
+		cols = append(cols, quoteIdentifier(col))
 		placeholders = append(placeholders, fmt.Sprintf("$%d", paramIdx))
-		vals = append(vals, v)
+		vals = append(vals, val)
 		paramIdx++
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", tableName, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", quoteIdentifier(tableName), strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 	var newID int
 	err = db.QueryRow(query, vals...).Scan(&newID)
 	if err != nil {
@@ -1733,22 +1774,122 @@ func addDatasetColumnHandler(w http.ResponseWriter, r *http.Request) {
 
 	safeType := mapColumnType(req.ColumnType)
 
-	query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, safeColName, safeType)
+	query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", quoteIdentifier(tableName), quoteIdentifier(safeColName), safeType)
 	_, err = db.Exec(query)
 	if err != nil {
 		http.Error(w, "Gagal menambahkan kolom ke database: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	invalidateTableMeta(tableName)
+	clearTileCache(tableName)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"message": "Kolom berhasil ditambahkan ke database!"}`))
 }
 var (
-	tileCache      = make(map[string][]byte)
-	tileCacheMutex sync.Mutex
+	tileCache           = make(map[string][]byte)
+	tileCacheMutex      sync.Mutex
+	datasetVersionMap   = make(map[string]int64)
+	datasetVersionLock  sync.RWMutex
+	tableMetaCache      = make(map[string]tableMeta)
+	tableMetaCacheMutex sync.RWMutex
 )
 
+type tableMeta struct {
+	srid     int
+	geomType string
+	columns  []string
+}
+
+func getDatasetVersion(tableName string) int64 {
+	datasetVersionLock.RLock()
+	v, ok := datasetVersionMap[tableName]
+	datasetVersionLock.RUnlock()
+	if ok && v > 0 {
+		return v
+	}
+	datasetVersionLock.Lock()
+	defer datasetVersionLock.Unlock()
+	if v, ok := datasetVersionMap[tableName]; ok && v > 0 {
+		return v
+	}
+	v = time.Now().Unix()
+	datasetVersionMap[tableName] = v
+	return v
+}
+
+func bumpDatasetVersion(tableName string) int64 {
+	datasetVersionLock.Lock()
+	v := time.Now().UnixNano()
+	datasetVersionMap[tableName] = v
+	datasetVersionLock.Unlock()
+	return v
+}
+
+func getTableMeta(tableName string) (int, string, []string, error) {
+	tableMetaCacheMutex.RLock()
+	meta, found := tableMetaCache[tableName]
+	tableMetaCacheMutex.RUnlock()
+	if found && len(meta.columns) > 0 {
+		return meta.srid, meta.geomType, meta.columns, nil
+	}
+
+	var srid int
+	var geomType string
+	err := db.QueryRow("SELECT COALESCE(srid, 4326), UPPER(COALESCE(geom_type, '')) FROM datasets WHERE table_name = $1", tableName).Scan(&srid, &geomType)
+	if err == sql.ErrNoRows {
+		return 0, "", nil, fmt.Errorf("tabel tidak ditemukan")
+	} else if err != nil {
+		return 0, "", nil, err
+	}
+	if srid == 0 {
+		srid = 4326
+	}
+
+	if geomType == "" || geomType == "GEOMETRY" {
+		var detectedType string
+		_ = db.QueryRow(fmt.Sprintf("SELECT UPPER(ST_GeometryType(geom)) FROM %s WHERE geom IS NOT NULL LIMIT 1", tableName)).Scan(&detectedType)
+		if detectedType != "" {
+			geomType = strings.TrimPrefix(detectedType, "ST_")
+		}
+	}
+
+	colRows, err := db.Query(`
+		SELECT column_name 
+		FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = $1 AND column_name NOT IN ('geom', 'create_gn', 'update_gn')
+		ORDER BY ordinal_position
+	`, tableName)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer colRows.Close()
+
+	var cols []string
+	for colRows.Next() {
+		var c string
+		if err := colRows.Scan(&c); err == nil {
+			cols = append(cols, c)
+		}
+	}
+
+	tableMetaCacheMutex.Lock()
+	tableMetaCache[tableName] = tableMeta{srid: srid, geomType: geomType, columns: cols}
+	tableMetaCacheMutex.Unlock()
+
+	return srid, geomType, cols, nil
+}
+
+func invalidateTableMeta(tableName string) {
+	tableMetaCacheMutex.Lock()
+	delete(tableMetaCache, tableName)
+	tableMetaCacheMutex.Unlock()
+}
+
 func clearTileCache(tableName string) {
+	bumpDatasetVersion(tableName)
+	invalidateTableMeta(tableName)
 	tileCacheMutex.Lock()
 	defer tileCacheMutex.Unlock()
 	prefix := tableName + "/"
@@ -1808,6 +1949,12 @@ func saveStylingHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var tableName string
+	db.QueryRow("SELECT COALESCE(table_name, '') FROM datasets WHERE id = $1", s.DatasetID).Scan(&tableName)
+	if tableName != "" {
+		clearTileCache(tableName)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"message": "Styling MapLibre berhasil disimpan secara permanen di Database!"}`))
 }
@@ -1821,7 +1968,12 @@ func mvtTileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tableName := parts[0]
+	tableName := sanitizeIdentifier(parts[0])
+	if tableName == "" {
+		http.Error(w, "Nama tabel tidak valid", http.StatusBadRequest)
+		return
+	}
+
 	if !authorizeTileAccess(r, tableName) {
 		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error": "Akses tile ditolak. Login atau sertakan token workspace yang valid."}`, http.StatusUnauthorized)
@@ -1835,61 +1987,99 @@ func mvtTileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheKey := fmt.Sprintf("%s/%d/%d/%d", tableName, z, x, y)
+	currentVersion := getDatasetVersion(tableName)
+	cacheKey := fmt.Sprintf("%s/%d/%d/%d/%d", tableName, currentVersion, z, x, y)
+
+	etag := fmt.Sprintf(`"mvt-%s-%d-%d-%d-%d"`, tableName, currentVersion, z, x, y)
+	if match := r.Header.Get("If-None-Match"); match == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	vParam := r.URL.Query().Get("v")
+
 	tileCacheMutex.Lock()
 	cachedTile, found := tileCache[cacheKey]
 	tileCacheMutex.Unlock()
 	if found {
 		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("ETag", etag)
+		if vParam != "" {
+			w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		}
 		w.Write(cachedTile)
 		return
 	}
 
-	var srid int
-	err := db.QueryRow("SELECT COALESCE(srid, 4326) FROM datasets WHERE table_name = $1", tableName).Scan(&srid)
-	if err == sql.ErrNoRows {
-		http.Error(w, "Tabel tidak ditemukan", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	colRows, err := db.Query(`
-		SELECT column_name 
-		FROM information_schema.columns 
-		WHERE table_name = $1 AND column_name != 'geom'
-	`, tableName)
+	srid, geomType, columns, err := getTableMeta(tableName)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Tabel tidak ditemukan: "+err.Error(), http.StatusNotFound)
 		return
-	}
-	defer colRows.Close()
-
-	var columns []string
-	for colRows.Next() {
-		var colName string
-		colRows.Scan(&colName)
-		columns = append(columns, colName)
 	}
 
 	var quotedCols []string
 	for _, c := range columns {
-		quotedCols = append(quotedCols, fmt.Sprintf(`"%s"`, c))
+		if c != "" && c != "geom" {
+			quotedCols = append(quotedCols, quoteIdentifier(c))
+		}
 	}
 	selectCols := strings.Join(quotedCols, ", ")
 	if selectCols != "" {
 		selectCols += ", "
 	}
 
-	query := fmt.Sprintf(`
-		SELECT ST_AsMVT(mvt_geom, $1) FROM (
-			SELECT %s ST_AsMVTGeom(ST_Transform(geom, 3857), ST_TileEnvelope($2, $3, $4), 4096, 64, true) AS geom
-			FROM %s
-			WHERE geom && ST_Transform(ST_TileEnvelope($2, $3, $4), %d)
-		) AS mvt_geom
-	`, selectCols, tableName, srid)
+	var safeGeomExpr string
+	var whereClause string
+	if srid == 3857 {
+		safeGeomExpr = "CASE WHEN ST_SRID(geom) = 0 THEN ST_SetSRID(geom, 3857) ELSE geom END"
+		whereClause = fmt.Sprintf("geom IS NOT NULL AND %s && ST_TileEnvelope($2, $3, $4)", safeGeomExpr)
+	} else {
+		safeGeomExpr = fmt.Sprintf("CASE WHEN ST_SRID(geom) = 0 THEN ST_SetSRID(geom, %d) ELSE geom END", srid)
+		whereClause = fmt.Sprintf("geom IS NOT NULL AND %s && ST_Transform(ST_TileEnvelope($2, $3, $4), %d)", safeGeomExpr, srid)
+	}
+
+	isPoint := strings.Contains(strings.ToUpper(geomType), "POINT")
+
+	var query string
+	if isPoint {
+		// Explode MULTIPOINT into individual 2D POINTs so MapLibre circle layers can render every single point!
+		// No ST_Simplify for points; buffer=256, clip_geom=false to avoid clipping boundary points.
+		query = fmt.Sprintf(`
+			SELECT ST_AsMVT(mvt_geom, $1) FROM (
+				SELECT * FROM (
+					SELECT %s ST_AsMVTGeom(ST_Transform(ST_Force2D(geom), 3857), ST_TileEnvelope($2, $3, $4), 4096, 256, false) AS geom
+					FROM (
+						SELECT %s (ST_Dump(ST_Force2D(%s))).geom AS geom
+						FROM %s
+						WHERE %s
+					) AS _sub_dump
+					WHERE geom IS NOT NULL
+				) AS _sub_mvt
+				WHERE geom IS NOT NULL
+			) AS mvt_geom
+		`, selectCols, selectCols, safeGeomExpr, quoteIdentifier(tableName), whereClause)
+	} else if z < 14 {
+		tolerance := 40075016.68557849 / (4096.0 * math.Pow(2, float64(z)) * 2.0)
+		geomExpr := fmt.Sprintf("ST_AsMVTGeom(ST_Simplify(ST_Transform(ST_Force2D(%s), 3857), %.4f), ST_TileEnvelope($2, $3, $4), 4096, 64, true) AS geom", safeGeomExpr, tolerance)
+		query = fmt.Sprintf(`
+			SELECT ST_AsMVT(mvt_geom, $1) FROM (
+				SELECT %s %s
+				FROM %s
+				WHERE %s
+			) AS mvt_geom
+		`, selectCols, geomExpr, quoteIdentifier(tableName), whereClause)
+	} else {
+		geomExpr := fmt.Sprintf("ST_AsMVTGeom(ST_Transform(ST_Force2D(%s), 3857), ST_TileEnvelope($2, $3, $4), 4096, 64, true) AS geom", safeGeomExpr)
+		query = fmt.Sprintf(`
+			SELECT ST_AsMVT(mvt_geom, $1) FROM (
+				SELECT %s %s
+				FROM %s
+				WHERE %s
+			) AS mvt_geom
+		`, selectCols, geomExpr, quoteIdentifier(tableName), whereClause)
+	}
 
 	var tileData []byte
 	err = db.QueryRow(query, tableName, z, x, y).Scan(&tileData)
@@ -1899,12 +2089,21 @@ func mvtTileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tileData == nil {
+		tileData = []byte{}
+	}
+
 	tileCacheMutex.Lock()
 	tileCache[cacheKey] = tileData
 	tileCacheMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("ETag", etag)
+	if vParam != "" {
+		w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	}
 	w.Write(tileData)
 }
 
@@ -1953,22 +2152,31 @@ func updateDatasetRowHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, _, dbCols, err := getTableMeta(tableName)
+	if err != nil {
+		http.Error(w, "Tabel tidak ditemukan: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	setClauses := []string{"geom = ST_GeomFromText($1, $2)"}
 	vals := []interface{}{req.GeomWKT, srid}
 	paramIdx := 3
 
-	for k, v := range req.Attributes {
-		safeK := sanitizeIdentifier(k)
-		if safeK == "" || isReservedFeatureColumn(safeK) || v == nil {
+	for _, col := range dbCols {
+		if isReservedFeatureColumn(col) || col == "geom" {
 			continue
 		}
-		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", safeK, paramIdx))
-		vals = append(vals, v)
+		val, ok := findPropertyCaseInsensitive(req.Attributes, col)
+		if !ok || val == nil {
+			continue
+		}
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", quoteIdentifier(col), paramIdx))
+		vals = append(vals, val)
 		paramIdx++
 	}
 
 	vals = append(vals, req.RowID)
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", tableName, strings.Join(setClauses, ", "), paramIdx)
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", quoteIdentifier(tableName), strings.Join(setClauses, ", "), paramIdx)
 	_, err = db.Exec(query, vals...)
 	if err != nil {
 		http.Error(w, "Gagal update data: "+err.Error(), http.StatusInternalServerError)
@@ -2175,6 +2383,7 @@ func ogcUploadGPKGHandler(w http.ResponseWriter, r *http.Request) {
 
 	db.Exec("INSERT INTO datasets (workspace_id, name, geom_type, srid, table_name) VALUES ($1, $2, $3, 4326, $4)",
 		workspaceID, displayName, geomType, tableName)
+	bumpDatasetVersion(tableName)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2256,35 +2465,24 @@ func getOldFeatureAsJSON(tableName string, featureID string) (geomJSON string, p
 		columns = append(columns, cName)
 	}
 	selectCols := []string{"ST_AsGeoJSON(ST_Transform(geom, 4326)) as geom_geojson"}
-	for _, c := range columns { selectCols = append(selectCols, fmt.Sprintf(`"%s"`, c)) }
-	row := db.QueryRow(fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", strings.Join(selectCols, ", "), tableName), featureID)
+	for _, c := range columns { selectCols = append(selectCols, quoteIdentifier(c)) }
+	row := db.QueryRow(fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", strings.Join(selectCols, ", "), quoteIdentifier(tableName)), featureID)
 	columnsPointers := make([]interface{}, len(selectCols))
 	columnValues := make([]interface{}, len(selectCols))
 	for i := range columnValues { columnsPointers[i] = &columnValues[i] }
 	if err := row.Scan(columnsPointers...); err != nil { return "", "{}" }
 	properties := make(map[string]interface{})
 	var geomRaw string
-	for i, colName := range selectCols {
-		val := columnValues[i]
-		if colName == "geom_geojson" {
-			if val != nil {
-				switch v := val.(type) {
-				case []byte: geomRaw = string(v)
-				case string: geomRaw = v
-				default: geomRaw = fmt.Sprintf("%s", val)
-				}
-			}
-		} else {
-			cleanName := strings.Trim(colName, `"`)
-			if cleanName == "id" { continue }
-			if val != nil {
-				switch v := val.(type) {
-				case []byte: properties[cleanName] = string(v)
-				case string: properties[cleanName] = v
-				default: properties[cleanName] = val
-				}
-			}
+	if columnValues[0] != nil {
+		switch v := columnValues[0].(type) {
+		case []byte: geomRaw = string(v)
+		case string: geomRaw = v
+		default: geomRaw = fmt.Sprintf("%s", columnValues[0])
 		}
+	}
+	for i, c := range columns {
+		if c == "id" { continue }
+		properties[c] = sqlValueToJSON(columnValues[i+1])
 	}
 	propsBytes, _ := json.Marshal(properties)
 	return geomRaw, string(propsBytes)
@@ -2370,18 +2568,28 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Determine absolute base URL for strict GIS clients (e.g. QGIS)
 	scheme := "http"
-	if r.Header.Get("X-Forwarded-Proto") != "" {
-		scheme = r.Header.Get("X-Forwarded-Proto")
+	if force := os.Getenv("FORCE_HTTPS"); strings.EqualFold(force, "true") || force == "1" {
+		scheme = "https"
+	} else if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
+	} else if strings.Contains(r.Header.Get("CF-Visitor"), "https") {
+		scheme = "https"
+	} else if strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on") {
+		scheme = "https"
 	} else if r.TLS != nil {
 		scheme = "https"
 	}
-	baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+	host := r.Host
+	if scheme == "https" && strings.HasSuffix(host, ":80") {
+		host = strings.TrimSuffix(host, ":80")
+	}
+	baseURL := fmt.Sprintf("%s://%s", scheme, host)
 
-	if path == "upload_gpkg" {
+	if path == "upload_gpkg" || path == "upload_gpkg/" {
 		ogcUploadGPKGHandler(w, r)
 		return
 	}
-	if path == "download_gpkg" {
+	if path == "download_gpkg" || path == "download_gpkg/" {
 		ogcDownloadGPKGHandler(w, r)
 		return
 	}
@@ -2535,12 +2743,11 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 			
 			columnsSQL := ""
 			for _, col := range req.Columns {
-				safeColName := sanitizeIdentifier(col.Name)
-				if safeColName == "" || safeColName == "geom" || safeColName == "id" {
+				if col.Name == "" || isReservedFeatureColumn(col.Name) {
 					continue
 				}
 				safeType := mapColumnType(col.Type)
-				columnsSQL += fmt.Sprintf(", %s %s", safeColName, safeType)
+				columnsSQL += fmt.Sprintf(", %s %s", quoteIdentifier(col.Name), safeType)
 			}
 
 			createTableQuery := fmt.Sprintf(`
@@ -2822,13 +3029,14 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 
 				safeType := mapColumnType(req.ColumnType)
 
-				query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, safeColName, safeType)
+				query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", quoteIdentifier(tableName), quoteIdentifier(safeColName), safeType)
 				_, err = db.Exec(query)
 				if err != nil {
 					http.Error(w, fmt.Sprintf(`{"error": "Gagal menambahkan kolom ke database: %s"}`, err.Error()), http.StatusInternalServerError)
 					return
 				}
 
+				invalidateTableMeta(tableName)
 				clearTileCache(tableName)
 
 				w.WriteHeader(http.StatusOK)
@@ -2839,19 +3047,19 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "DELETE" {
 				w.Header().Set("Content-Type", "application/json")
 				colName := r.URL.Query().Get("name")
-				safeColName := sanitizeIdentifier(colName)
-				if safeColName == "" || safeColName == "geom" || safeColName == "id" {
+				if colName == "" || colName == "geom" || colName == "id" {
 					http.Error(w, `{"error": "Nama kolom tidak valid"}`, http.StatusBadRequest)
 					return
 				}
 
-				query := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", tableName, safeColName)
+				query := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", quoteIdentifier(tableName), quoteIdentifier(colName))
 				_, err = db.Exec(query)
 				if err != nil {
 					http.Error(w, fmt.Sprintf(`{"error": "Gagal menghapus kolom dari database: %s"}`, err.Error()), http.StatusInternalServerError)
 					return
 				}
 
+				invalidateTableMeta(tableName)
 				clearTileCache(tableName)
 
 				w.WriteHeader(http.StatusOK)
@@ -2984,28 +3192,22 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				placeholders = append(placeholders, fmt.Sprintf("ST_SetSRID(ST_GeomFromGeoJSON($1), %d)", srid))
 				vals = append(vals, string(geomBytes))
 
-				cleanProps := make(map[string]interface{})
-				for k, v := range body.Properties {
-					cleanProps[sanitizeIdentifier(k)] = v
-				}
-				body.Properties = cleanProps
-
 				pCount := 1
 				for _, col := range columns {
-					if isReservedFeatureColumn(col) {
+					if isReservedFeatureColumn(col) || col == "geom" {
 						continue
 					}
-					val, ok := body.Properties[col]
+					val, ok := findPropertyCaseInsensitive(body.Properties, col)
 					if !ok || val == nil {
 						continue
 					}
 					pCount++
-					cols = append(cols, fmt.Sprintf(`"%s"`, col))
+					cols = append(cols, quoteIdentifier(col))
 					placeholders = append(placeholders, fmt.Sprintf("$%d", pCount))
 					vals = append(vals, val)
 				}
 
-				query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", tableName, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+				query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id", quoteIdentifier(tableName), strings.Join(cols, ", "), strings.Join(placeholders, ", "))
 				var newID int
 				err = db.QueryRow(query, vals...).Scan(&newID)
 				if err != nil {
@@ -3053,7 +3255,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 
 				selectCols := []string{"ST_AsGeoJSON(ST_Transform(geom, 4326)) as geom_geojson"}
 				for _, c := range columns {
-					selectCols = append(selectCols, fmt.Sprintf(`"%s"`, c))
+					selectCols = append(selectCols, quoteIdentifier(c))
 				}
 
 				limitStr := r.URL.Query().Get("limit")
@@ -3077,7 +3279,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 					limitClause = fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 				}
 
-				query := fmt.Sprintf("SELECT %s FROM %s ORDER BY id ASC%s", strings.Join(selectCols, ", "), tableName, limitClause)
+				query := fmt.Sprintf("SELECT %s FROM %s ORDER BY id ASC%s", strings.Join(selectCols, ", "), quoteIdentifier(tableName), limitClause)
 				rows, err := db.Query(query)
 				if err != nil {
 					log.Printf("OGC GET ITEMS ERROR: %v (Query: %s)", err, query)
@@ -3314,14 +3516,15 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "GET" || r.Method == "HEAD" {
 				w.Header().Set("Content-Type", "application/geo+json")
 				selectCols := []string{"ST_AsGeoJSON(ST_Transform(geom, 4326)) as geom_geojson"}
-				selectCols = append(selectCols, columns...)
+				for _, c := range columns {
+					selectCols = append(selectCols, quoteIdentifier(c))
+				}
 
-				query := fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", strings.Join(selectCols, ", "), tableName)
+				query := fmt.Sprintf("SELECT %s FROM %s WHERE id = $1", strings.Join(selectCols, ", "), quoteIdentifier(tableName))
 				row := db.QueryRow(query, featureID)
 
-				cols := selectCols
-				columnsPointers := make([]interface{}, len(cols))
-				columnValues := make([]interface{}, len(cols))
+				columnsPointers := make([]interface{}, len(selectCols))
+				columnValues := make([]interface{}, len(selectCols))
 				for i := range columnValues {
 					columnsPointers[i] = &columnValues[i]
 				}
@@ -3335,65 +3538,23 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				var geomRaw string
 				var rowID interface{}
 
-				for i, colName := range cols {
-					val := columnValues[i]
-					if colName == "geom_geojson" {
-						if val == nil {
-							continue
-						}
-						var strVal string
-						isStrOrBytes := false
-						switch v := val.(type) {
-						case []byte:
-							strVal = string(v)
-							isStrOrBytes = true
-						case string:
-							strVal = v
-							isStrOrBytes = true
-						}
-						if isStrOrBytes {
-							geomRaw = strVal
-						} else {
-							geomRaw = fmt.Sprintf("%s", val)
-						}
-					} else if colName == "id" {
-						if val == nil {
-							continue
-						}
-						var strVal string
-						isStrOrBytes := false
-						switch v := val.(type) {
-						case []byte:
-							strVal = string(v)
-							isStrOrBytes = true
-						case string:
-							strVal = v
-							isStrOrBytes = true
-						}
+				if columnValues[0] != nil {
+					switch v := columnValues[0].(type) {
+					case []byte:
+						geomRaw = string(v)
+					case string:
+						geomRaw = v
+					default:
+						geomRaw = fmt.Sprintf("%s", columnValues[0])
+					}
+				}
+
+				for i, colName := range columns {
+					val := columnValues[i+1]
+					if colName == "id" {
 						rowID = val
-						if isStrOrBytes {
-							rowID = strVal
-						}
 					} else {
-						if val == nil {
-							properties[colName] = nil
-						} else {
-							var strVal string
-							isStrOrBytes := false
-							switch v := val.(type) {
-							case []byte:
-								strVal = string(v)
-								isStrOrBytes = true
-							case string:
-								strVal = v
-								isStrOrBytes = true
-							}
-							if isStrOrBytes {
-								properties[colName] = strVal
-							} else {
-								properties[colName] = val
-							}
-						}
+						properties[colName] = sqlValueToJSON(val)
 					}
 				}
 
@@ -3452,7 +3613,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				}
 
 				var exists bool
-				err = db.QueryRow(fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)", tableName), featureID).Scan(&exists)
+				err = db.QueryRow(fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)", quoteIdentifier(tableName)), featureID).Scan(&exists)
 				if err != nil || !exists {
 					http.Error(w, `{"error": "Feature tidak ditemukan"}`, http.StatusNotFound)
 					return
@@ -3464,23 +3625,17 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				setClauses = append(setClauses, fmt.Sprintf("geom = ST_SetSRID(ST_GeomFromGeoJSON($1), %d)", srid))
 				vals = append(vals, string(geomBytes))
 
-				cleanProps := make(map[string]interface{})
-				for k, v := range body.Properties {
-					cleanProps[sanitizeIdentifier(k)] = v
-				}
-				body.Properties = cleanProps
-
 				pCount := 1
 				for _, col := range columns {
-					if isReservedFeatureColumn(col) {
+					if isReservedFeatureColumn(col) || col == "geom" {
 						continue
 					}
-					val, ok := body.Properties[col]
+					val, ok := findPropertyCaseInsensitive(body.Properties, col)
 					if !ok || val == nil {
 						continue
 					}
 					pCount++
-					setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
+					setClauses = append(setClauses, fmt.Sprintf("%s = $%d", quoteIdentifier(col), pCount))
 					vals = append(vals, val)
 				}
 
@@ -3489,7 +3644,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				
 				oldGeom, oldProps := getOldFeatureAsJSON(tableName, featureID)
 				
-				query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", tableName, strings.Join(setClauses, ", "), pCount)
+				query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", quoteIdentifier(tableName), strings.Join(setClauses, ", "), pCount)
 				_, err = db.Exec(query, vals...)
 				if err != nil {
 					http.Error(w, fmt.Sprintf(`{"error": "Gagal update: %s"}`, err.Error()), http.StatusInternalServerError)
@@ -3520,7 +3675,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				}
 
 				var exists bool
-				err = db.QueryRow(fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)", tableName), featureID).Scan(&exists)
+				err = db.QueryRow(fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE id = $1)", quoteIdentifier(tableName)), featureID).Scan(&exists)
 				if err != nil || !exists {
 					http.Error(w, `{"error": "Feature tidak ditemukan"}`, http.StatusNotFound)
 					return
@@ -3542,22 +3697,16 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 				}
 
 				if patch.Properties != nil {
-					cleanProps := make(map[string]interface{})
-					for k, v := range *patch.Properties {
-						cleanProps[sanitizeIdentifier(k)] = v
-					}
-					patch.Properties = &cleanProps
-
 					for _, col := range columns {
-						if isReservedFeatureColumn(col) {
+						if isReservedFeatureColumn(col) || col == "geom" {
 							continue
 						}
-						val, ok := (*patch.Properties)[col]
+						val, ok := findPropertyCaseInsensitive(*patch.Properties, col)
 						if !ok || val == nil {
 							continue
 						}
 						pCount++
-						setClauses = append(setClauses, fmt.Sprintf(`"%s" = $%d`, col, pCount))
+						setClauses = append(setClauses, fmt.Sprintf("%s = $%d", quoteIdentifier(col), pCount))
 						vals = append(vals, val)
 					}
 				}
@@ -3568,7 +3717,7 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 					
 					oldGeom, oldProps := getOldFeatureAsJSON(tableName, featureID)
 					
-					query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", tableName, strings.Join(setClauses, ", "), pCount)
+					query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", quoteIdentifier(tableName), strings.Join(setClauses, ", "), pCount)
 					_, err = db.Exec(query, vals...)
 					if err != nil {
 						http.Error(w, fmt.Sprintf(`{"error": "Gagal patch: %s"}`, err.Error()), http.StatusInternalServerError)
@@ -3596,13 +3745,10 @@ func ogcFeaturesCRUDHandler(w http.ResponseWriter, r *http.Request) {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GISNAS-User, X-GISNAS-Role, X-GISNAS-Token")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GISNAS-User, X-GISNAS-Role, X-GISNAS-Token, X-Requested-With, Accept, Origin")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == "OPTIONS" {
-			if strings.HasPrefix(r.URL.Path, "/api/ogc") || strings.HasPrefix(r.URL.Path, "/token/") {
-				next.ServeHTTP(w, r)
-				return
-			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}

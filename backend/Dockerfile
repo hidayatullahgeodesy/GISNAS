@@ -1,20 +1,19 @@
-FROM golang:1.21-bullseye
+FROM golang:1.22-bookworm
 
 WORKDIR /app
 
-# Initialize Go modules
+# Install GDAL (for ogr2ogr with PostgreSQL driver) first to leverage Docker layer caching
+RUN apt-get update && apt-get install -y --no-install-recommends gdal-bin && rm -rf /var/lib/apt/lists/*
+
+# Initialize Go modules and copy source
 COPY go.mod ./
 COPY *.go ./
 
-# Run go mod tidy to automatically fetch dependencies and generate go.sum
+# Fetch dependencies and build
 RUN go mod tidy
-
-# Install GDAL (for ogr2ogr with PostgreSQL driver)
-RUN apt-get update && apt-get install -y gdal-bin
-
-# Build the application
-RUN go build -o /gisnas-backend
+RUN go build -o /gisnas-backend .
 
 EXPOSE 8080
 
 CMD [ "/gisnas-backend" ]
+

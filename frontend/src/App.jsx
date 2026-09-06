@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, useParams } from 'react-router-dom';
-import { Play, Square, Plus, ShieldAlert, Upload, Map as MapIcon, LogOut, Folder, FilePlus, Trash2, Users, UserPlus, CheckCircle, XCircle } from 'lucide-react';
+import { Play, Square, Plus, ShieldAlert, Upload, Map as MapIcon, LogOut, Folder, FilePlus, Trash2, Users, UserPlus, CheckCircle, XCircle, RotateCw } from 'lucide-react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './index.css';
@@ -771,6 +771,28 @@ function MapPreview() {
     }
   };
 
+  const handleRefreshMap = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/datasets?workspace_id=${workspaceId}`);
+      if (res.ok) {
+        const data = await res.json();
+        const t = Date.now();
+        const updated = (data || []).map(d => ({ ...d, version: t }));
+        setDatasets(updated);
+        if (mapInstance) {
+          updated.forEach(ds => {
+            const source = mapInstance.getSource(ds.table_name);
+            if (source && typeof source.setTiles === 'function') {
+              source.setTiles([`${window.location.origin}/api/tiles/${ds.table_name}/{z}/{x}/{y}.pbf?v=${t}`]);
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const handleRenameLayer = async (ds) => {
     if (await renameDataset(ds.id, ds.name)) {
       loadDatasets();
@@ -861,12 +883,43 @@ function MapPreview() {
     const addAllLayers = () => {
       if (!mapInstance.isStyleLoaded()) return;
 
-      datasets.forEach(ds => {
-        if (mapInstance.getSource(ds.table_name)) return;
+      // Sort datasets so fill (polygons) are at the bottom, lines in the middle, and circles (points) on top!
+      const sortedDatasets = [...datasets].sort((a, b) => {
+        const order = { fill: 1, line: 2, circle: 3 };
+        return (order[getLayerType(a.geom_type)] || 2) - (order[getLayerType(b.geom_type)] || 2);
+      });
+
+      sortedDatasets.forEach(ds => {
+        const tileUrl = `${window.location.origin}/api/tiles/${ds.table_name}/{z}/{x}/{y}.pbf?v=${ds.version || 1}`;
+        const existingSource = mapInstance.getSource(ds.table_name);
+        if (existingSource) {
+          if (existingSource.tiles && existingSource.tiles[0] !== tileUrl && typeof existingSource.setTiles === 'function') {
+            existingSource.setTiles([tileUrl]);
+          }
+          const layerType = getLayerType(ds.geom_type);
+          if (layerType === 'fill') {
+            if (mapInstance.getLayer(`${ds.table_name}-fill`)) {
+              mapInstance.setPaintProperty(`${ds.table_name}-fill`, 'fill-color', ds.fill_color || '#3b82f6');
+            }
+            if (mapInstance.getLayer(`${ds.table_name}-outline`)) {
+              mapInstance.setPaintProperty(`${ds.table_name}-outline`, 'line-color', ds.stroke_color || '#ffffff');
+            }
+          } else if (layerType === 'line') {
+            if (mapInstance.getLayer(ds.table_name)) {
+              mapInstance.setPaintProperty(ds.table_name, 'line-color', ds.fill_color || '#3b82f6');
+            }
+          } else if (layerType === 'circle') {
+            if (mapInstance.getLayer(ds.table_name)) {
+              mapInstance.setPaintProperty(ds.table_name, 'circle-color', ds.fill_color || '#3b82f6');
+              mapInstance.setPaintProperty(ds.table_name, 'circle-stroke-color', ds.stroke_color || '#ffffff');
+            }
+          }
+          return;
+        }
 
         mapInstance.addSource(ds.table_name, {
           type: 'vector',
-          tiles: [`${window.location.origin}/api/tiles/${ds.table_name}/{z}/{x}/{y}.pbf`],
+          tiles: [tileUrl],
           maxzoom: 18
         });
 
@@ -1120,37 +1173,47 @@ function MapPreview() {
           <h3 style={{ margin: 0, fontSize: '0.9rem', fontWeight: 'bold', color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <MapIcon size={16} color="#0078d7" /> Workspace Layers
           </h3>
-          {datasets.length > 0 && (
+          <div style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
             <button 
-              className="btn btn-primary" 
-              style={{ margin: 0, padding: '0.25rem 0.5rem', fontSize: '0.65rem' }}
-              onClick={() => {
-                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-                let hasValidCoords = false;
-                datasets.forEach(ds => {
-                  if (ds.bbox && ds.bbox.length === 4) {
-                    const isPlaceholder = ds.bbox[0] === 118.0 && ds.bbox[1] === -2.5 && ds.bbox[2] === 118.0 && ds.bbox[3] === -2.5;
-                    if (!isPlaceholder || datasets.length === 1) {
-                      minX = Math.min(minX, ds.bbox[0]);
-                      minY = Math.min(minY, ds.bbox[1]);
-                      maxX = Math.max(maxX, ds.bbox[2]);
-                      maxY = Math.max(maxY, ds.bbox[3]);
-                      hasValidCoords = true;
+              className="btn" 
+              style={{ margin: 0, padding: '0.25rem 0.5rem', fontSize: '0.65rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}
+              onClick={handleRefreshMap}
+              title="Refresh / Muat ulang layer dan tiles dari database"
+            >
+              <RotateCw size={11} /> Refresh
+            </button>
+            {datasets.length > 0 && (
+              <button 
+                className="btn btn-primary" 
+                style={{ margin: 0, padding: '0.25rem 0.5rem', fontSize: '0.65rem' }}
+                onClick={() => {
+                  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                  let hasValidCoords = false;
+                  datasets.forEach(ds => {
+                    if (ds.bbox && ds.bbox.length === 4) {
+                      const isPlaceholder = ds.bbox[0] === 118.0 && ds.bbox[1] === -2.5 && ds.bbox[2] === 118.0 && ds.bbox[3] === -2.5;
+                      if (!isPlaceholder || datasets.length === 1) {
+                        minX = Math.min(minX, ds.bbox[0]);
+                        minY = Math.min(minY, ds.bbox[1]);
+                        maxX = Math.max(maxX, ds.bbox[2]);
+                        maxY = Math.max(maxY, ds.bbox[3]);
+                        hasValidCoords = true;
+                      }
+                    }
+                  });
+                  if (hasValidCoords && minX !== Infinity) {
+                    if (minX === maxX && minY === maxY) {
+                      mapInstance?.easeTo({ center: [minX, minY], zoom: 12 });
+                    } else {
+                      mapInstance?.fitBounds([[minX, minY], [maxX, maxY]], { padding: 80, maxZoom: 15 });
                     }
                   }
-                });
-                if (hasValidCoords && minX !== Infinity) {
-                  if (minX === maxX && minY === maxY) {
-                    mapInstance?.easeTo({ center: [minX, minY], zoom: 12 });
-                  } else {
-                    mapInstance?.fitBounds([[minX, minY], [maxX, maxY]], { padding: 80, maxZoom: 15 });
-                  }
-                }
-              }}
-            >
-              Zoom to Data
-            </button>
-          )}
+                }}
+              >
+                Zoom to Data
+              </button>
+            )}
+          </div>
         </div>
 
         {datasets.length === 0 ? (
@@ -1192,6 +1255,22 @@ function MapPreview() {
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: '0.2rem', flexShrink: 0 }}>
+                    {ds.bbox && ds.bbox.length === 4 && !(ds.bbox[0] === 118.0 && ds.bbox[1] === -2.5) && (
+                      <button
+                        className="btn"
+                        style={{ padding: '0.15rem 0.3rem', fontSize: '0.65rem', marginTop: 0 }}
+                        onClick={() => {
+                          if (ds.bbox[0] === ds.bbox[2] && ds.bbox[1] === ds.bbox[3]) {
+                            mapInstance?.easeTo({ center: [ds.bbox[0], ds.bbox[1]], zoom: 14 });
+                          } else {
+                            mapInstance?.fitBounds([[ds.bbox[0], ds.bbox[1]], [ds.bbox[2], ds.bbox[3]]], { padding: 80, maxZoom: 16 });
+                          }
+                        }}
+                        title="Zoom langsung ke layer ini"
+                      >
+                        Zoom
+                      </button>
+                    )}
                     <button
                       className="btn"
                       style={{ padding: '0.15rem 0.3rem', fontSize: '0.65rem', marginTop: 0 }}
@@ -1474,9 +1553,9 @@ function OGCAPI({ workspaceId }) {
   };
 
   const getOGCApiUrl = (tokenStr) => {
-    const host = window.location.hostname;
+    const origin = window.location.origin;
     const tokenPart = tokenStr ? `/token/${tokenStr}` : '';
-    return `http://${host}${tokenPart}/api/ogc/features`;
+    return `${origin}${tokenPart}/api/ogc/features`;
   };
 
   return (
